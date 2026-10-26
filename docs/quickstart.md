@@ -1,78 +1,127 @@
-# Quick Start
+# Verify your first delegation chain
 
-This walkthrough builds a delegation chain and verifies it offline. It needs no hardware TEE and no network. It exercises the part of cA2A that is built today: attenuated delegation and offline chain verification.
+This page is for anyone who wants to see cA2A's core check working on their own computer. You build a chain of two handoffs: a starting authority (the root) gives a middle agent permission to `read` and `write`, and the middle agent passes only `read` on to a final agent (the leaf). You then check the chain, and watch it refuse two bad cases: a root you never agreed to trust, and a correctly signed grant that asks for more than its parent had.
+
+After installation, this example needs no network, no special hardware, and no running agents.
 
 ## Install
 
-```bash
-pip install ca2a-runtime
-```
-
-Or run the published rootless container with a read-only configuration mount:
+Use Python 3.11+, Git, and Bash on Linux, macOS, or Windows with WSL. Install from the current source checkout so the example uses the verification behavior documented here.
 
 ```bash
-docker run --rm -p 8443:8443 \
-  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
-  -v "$PWD/ca2a-config.yaml:/etc/ca2a/config.yaml:ro" \
-  ghcr.io/agentrust-io/ca2a-runtime:v0.2.0 \
-  start --config /etc/ca2a/config.yaml
+git clone https://github.com/agentrust-io/ca2a.git ca2a-quickstart
+cd ca2a-quickstart
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 ```
-
-The image runs as UID/GID 10001. Hardware-backed providers additionally need
-the relevant device passed through with permissions for that identity; do not
-run the whole container as root to obtain device access.
-
-cA2A 0.2 is published as a normal release. Contributors working from a checkout can instead install from source: `pip install -e ".[dev]"`.
 
 ## Build an example chain
 
-The repo ships a generator that produces a valid three-hop chain (`admin` narrows to `read+write` narrows to `read`):
-
-```bash
-python scripts/gen_example_chain.py
-# wrote examples/minimal/chain.json
-```
-
-Each hop is a signed `DelegationCredential`. The scope of each hop is a subset of its parent, continuity is preserved (each issuer is the previous subject), and each hop links to its parent by `credential_id`.
-
-## Verify it
-
-```bash
-ca2a verify-chain --chain examples/minimal/chain.json --trusted-root-issuer <trusted-root-issuer-hex>
-# {"verified": true, "hops": 3, "leaf_scope": ["cap:read"]}
-```
-
-Verification checks four invariants and fails on the first violation:
-
-1. **Signature** on every hop against the issuer's Ed25519 public key.
-2. **Continuity**: each hop's issuer is the previous hop's subject.
-3. **Attenuation**: each hop's scope is a subset of its parent's scope.
-4. **Anti-replay**: `parent_id` links to the previous `credential_id` and every `credential_id` is unique.
-
-## Try to break it
-
-Edit `examples/minimal/chain.json` so a child hop adds a capability its parent did not hold, then re-run:
-
-```bash
-ca2a verify-chain --chain examples/minimal/chain.json --trusted-root-issuer <trusted-root-issuer-hex>
-# {"verified": false, "code": "SCOPE_ESCALATION", "error": "hop 1 scope exceeds parent grant"}
-```
-
-## Build a chain in code
+Save this complete block as `first_chain.py`, then run `python first_chain.py`:
 
 ```python
+import json
+import time
+from pathlib import Path
+
 from ca2a_runtime.delegation import DelegationCredential, new_keypair, verify_chain
+from ca2a_runtime.errors import CA2AError
 
 root_priv, root_pub = new_keypair()
 mid_priv, mid_pub = new_keypair()
 _, leaf_pub = new_keypair()
+now = int(time.time())
+root = DelegationCredential(
+    "demo-root", root_pub, mid_pub, frozenset({"cap:read", "cap:write"}), 0,
+    not_before=now - 5, not_after=now + 3600,
+).sign(root_priv)
+child = DelegationCredential(
+    "demo-child", mid_pub, leaf_pub, frozenset({"cap:read"}), 1,
+    parent_id="demo-root", not_before=now - 5, not_after=now + 1800,
+).sign(mid_priv)
 
-root = DelegationCredential("c0", root_pub, mid_pub, frozenset({"cap:a", "cap:b"}), 0).sign(root_priv)
-child = DelegationCredential("c1", mid_pub, leaf_pub, frozenset({"cap:a"}), 1, parent_id="c0").sign(mid_priv)
+# Retain the approved issuer separately from the chain being inspected.
+trusted_roots = {root_pub}
+verify_chain([root, child], trusted_root_issuers=trusted_roots)
+print("PASS: two-hop chain verified; leaf scope is cap:read")
 
-verify_chain([root, child])  # raises on any violation
+try:
+    verify_chain([root, child], trusted_root_issuers=set())
+except CA2AError as exc:
+    assert exc.code == "UNTRUSTED_DELEGATION_ROOT", exc.code
+    print("PASS: untrusted root rejected")
+else:
+    raise AssertionError("An untrusted root was accepted")
+
+# Sign the invalid grant so this tests authorization, not edited signature bytes.
+escalated = DelegationCredential(
+    "demo-escalated", mid_pub, leaf_pub, frozenset({"cap:admin"}), 1,
+    parent_id="demo-root", not_before=now - 5, not_after=now + 1800,
+).sign(mid_priv)
+try:
+    verify_chain([root, escalated], trusted_root_issuers=trusted_roots)
+except CA2AError as exc:
+    assert exc.code == "SCOPE_ESCALATION", exc.code
+    print("PASS: signed scope escalation rejected")
+else:
+    raise AssertionError("An escalated grant was accepted")
+
+Path("demo-chain.json").write_text(json.dumps({
+    "chain": [item.body() | {"signature": item.signature} for item in [root, child]]
+}, indent=2))
+Path("trusted-root.txt").write_text(root_pub)
+print("Saved demo-chain.json and trusted-root.txt; private keys were not saved")
 ```
+
+Expected output:
+
+```text
+PASS: two-hop chain verified; leaf scope is cap:read
+PASS: untrusted root rejected
+PASS: signed scope escalation rejected
+Saved demo-chain.json and trusted-root.txt; private keys were not saved
+```
+
+## Verify it
+
+Check the saved chain with the command-line tool. You pass in the root key you kept separately, which is how the checker knows which starting authority you trust:
+
+```bash
+ca2a verify-chain --chain demo-chain.json --trusted-root-issuer "$(cat trusted-root.txt)"
+```
+
+Expected exit code: `0`.
+
+```json
+{"verified": true, "hops": 2, "leaf_scope": ["cap:read"], "revocation": "not_checked"}
+```
+
+In real use, the agent receiving the work (the relying party) decides which roots to trust through its own approval process. Copying the root out of an incoming chain and trusting it would let that chain choose its own authority.
+
+## Try to break it
+
+The script signs a child grant that asks for more than its parent had, and expects `SCOPE_ESCALATION` (scope is the list of permissions in a grant). If you instead edit a field in the saved JSON by hand, the signature check fails first. These are two different checks: a broken signature shows the file was changed, while the scope check shows a correctly signed grant still cannot widen its own permissions.
+
+The checker also confirms that each grant was issued by the agent the previous grant was given to, that parent links and credential IDs line up, that the chain is not too long, and that each grant is inside its valid time window. It does not keep a list of every request it has seen before; stopping a live request from being replayed is a separate job for the running service.
+
+## Build a chain in code
+
+The script above uses the same `DelegationCredential` and `verify_chain` functions the running service uses. `trusted_root_issuers` is required: with no trusted root, nothing verifies. Keep the root grant and each child grant within your own authorization rules.
 
 ## What is not in this walkthrough
 
-The runtime peer path accepts a delegation credential on a live inbound A2A call, appraises the peer, seals the payload, enforces local policy, and emits signed provenance. The walkthrough defaults to software assurance; see [ROADMAP.md](../ROADMAP.md) and [LIMITATIONS.md](../LIMITATIONS.md) before making hardware-backed claims.
+This example checks signed grants only. It does not run a task, check hardware, encrypt a task for another agent, or check the signed records each handoff leaves (the TRACE provenance chain). Read [How It Works](concepts.md) for what happens on a live call between agents, and [Limitations](../LIMITATIONS.md) for what has been shown on real hardware.
+
+## Troubleshooting
+
+- **Module not found:** activate `.venv` in the terminal running the example.
+- **File not found:** run `first_chain.py` from the same directory as the CLI command.
+- **Untrusted root:** use this demo's retained key. Do not trust keys solely because an incoming chain supplies them.
+- **Expired credential:** the child lasts 30 minutes. Rerun the script to generate a fresh demo chain.
+
+## Next steps
+
+- [Architecture](concepts.md): trust checks and runtime boundaries.
+- [Delegation specification](spec/delegation-chain.md): validation rules.
+- [Limitations](../LIMITATIONS.md): software and hardware assurance boundaries.

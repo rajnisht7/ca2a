@@ -1,20 +1,12 @@
 # Sponsors
 
-cA2A is an open-source AgenTrust project governed through its published
-project processes. Sponsors provide funding, engineering time, infrastructure,
-or other in-kind support. Sponsorship does not confer project ownership,
-governance authority, or control over technical decisions.
+AgenTrust is an independent open-source project. No company funds, owns or directs it; contributions are voluntary.
 
-## Current sponsors
-
-### OPAQUE Systems
-
-Founding engineering and infrastructure sponsor, and contributor to the
-project's confidential-computing integrations.
+OPAQUE Systems sponsored early development until October 2026.
 
 ## Recognition policy
 
-Sponsor recognition records support for the project. Adopters are listed
-separately in [ADOPTERS.md](ADOPTERS.md), maintainers in
-[MAINTAINERS.md](MAINTAINERS.md), and governance roles in
+Sponsor recognition records past support and confers no ownership or governance rights. Adopters are listed
+separately in [ADOPTERS.md](https://github.com/agentrust-io/ca2a/blob/main/ADOPTERS.md), maintainers in
+[MAINTAINERS.md](https://github.com/agentrust-io/ca2a/blob/main/MAINTAINERS.md), and governance roles in
 [GOVERNANCE.md](GOVERNANCE.md).

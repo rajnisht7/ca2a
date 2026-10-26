@@ -8,6 +8,7 @@ without one, the peer key is accepted at ``assurance="none"`` (software mode).
 
 from __future__ import annotations
 
+import http.client
 import json
 import secrets
 import urllib.error
@@ -17,12 +18,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from ca2a_runtime.attestation import (
     ChannelOffer,
     VerifiedPeer,
     Verifier,
+    caller_possession_transcript,
     offer_channel,
+    prove_caller_possession,
     seal_to_peer,
     verify_offer,
 )
@@ -30,12 +34,19 @@ from ca2a_runtime.delegation.credential import DelegationCredential
 from ca2a_runtime.delegation.holder import build_holder_proof
 from ca2a_runtime.errors import AttestationFailed, CA2AError, TransportError
 from ca2a_runtime.peer import PeerRequest
+from ca2a_runtime.response import (
+    AuthenticatedPeerError,
+    PendingResponse,
+    ResponseAuthenticationFailed,
+)
 from ca2a_runtime.tee.base import BaseProvider
+from ca2a_runtime.tee.binding import ROLE_CALLER
 from ca2a_runtime.transport import a2a_adapter, wire
-from ca2a_runtime.transport.server import CHANNEL_PATH, TASK_PATH
+from ca2a_runtime.transport.server import AUTHENTICATED_TASK_PATH, CHANNEL_PATH, TASK_PATH
 
 _TIMEOUT = 10.0
 _ALLOWED_SCHEMES = ("http", "https")
+_MAX_RESPONSE = 1 << 20
 
 
 def _require_http_url(url: str) -> None:
@@ -52,10 +63,29 @@ def _require_http_url(url: str) -> None:
         )
 
 
+def _read_bounded(resp: Any) -> bytes:
+    """Read a response body, failing closed once it exceeds ``_MAX_RESPONSE``.
+
+    A callee's ``Content-Length`` header is not trusted as the cap: a hostile
+    or simply broken peer can omit it, lie about it, or use chunked transfer
+    encoding, and ``http.client`` will still hand back whatever bytes arrive.
+    Reading one byte past the limit and checking the actual length -- the same
+    read-then-check shape ``server.py`` uses for the request side via
+    ``_MAX_BODY`` -- bounds memory regardless of what the peer claims.
+    """
+    body = resp.read(_MAX_RESPONSE + 1)
+    if len(body) > _MAX_RESPONSE:
+        raise TransportError(
+            "peer response exceeds the maximum allowed size",
+            detail=f"body must be at most {_MAX_RESPONSE} bytes",
+        )
+    return body
+
+
 def _get_json(url: str) -> dict[str, Any]:
     _require_http_url(url)
     with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp:  # noqa: S310  # nosec B310
-        return json.loads(resp.read())
+        return json.loads(_read_bounded(resp))
 
 
 def _post_json(url: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -66,9 +96,31 @@ def _post_json(url: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     )
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310  # nosec B310
-            return resp.status, json.loads(resp.read())
+            return resp.status, json.loads(_read_bounded(resp))
     except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read())
+        return exc.code, json.loads(_read_bounded(exc))
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> None:
+        return None
+
+
+def _post_authenticated(url: str, raw: bytes) -> tuple[int, bytes]:
+    _require_http_url(url)
+    # No proxy inheritance, redirect, or automatic replay of a submitted task.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    request = urllib.request.Request(
+        url, data=raw, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with opener.open(request, timeout=_TIMEOUT) as response:
+            return response.status, _read_bounded(response)
+    except urllib.error.HTTPError as exc:
+        with exc:
+            return exc.code, _read_bounded(exc)
 
 
 @dataclass(frozen=True)
@@ -84,7 +136,9 @@ class Handshake:
     challenge: str | None
 
 
-def handshake(base_url: str, *, verifier: Verifier | None = None) -> Handshake:
+def handshake(
+    base_url: str, *, verifier: Verifier | None = None, require_hardware: bool = False
+) -> Handshake:
     """Fetch the peer's attested channel key, verify it, and keep its challenge.
 
     One round trip serves both directions: the nonce is the caller's own and is
@@ -95,14 +149,18 @@ def handshake(base_url: str, *, verifier: Verifier | None = None) -> Handshake:
     body = _get_json(f"{base_url}{CHANNEL_PATH}?nonce={nonce}")
     offer = wire.parse_channel_offer(body)
     return Handshake(
-        peer=verify_offer(offer, expected_nonce=nonce, verifier=verifier),
+        peer=verify_offer(
+            offer, expected_nonce=nonce, verifier=verifier, require_hardware=require_hardware
+        ),
         challenge=wire.parse_challenge(body),
     )
 
 
-def fetch_verified_peer(base_url: str, *, verifier: Verifier | None = None) -> VerifiedPeer:
+def fetch_verified_peer(
+    base_url: str, *, verifier: Verifier | None = None, require_hardware: bool = False
+) -> VerifiedPeer:
     """Fetch the peer's attested channel key and verify it under a fresh nonce."""
-    return handshake(base_url, verifier=verifier).peer
+    return handshake(base_url, verifier=verifier, require_hardware=require_hardware).peer
 
 
 def send_task(
@@ -114,8 +172,10 @@ def send_task(
     holder_key: Ed25519PrivateKey,
     payload: bytes | None = None,
     verifier: Verifier | None = None,
+    require_hardware: bool = False,
     parent_record_hash: str | None = None,
     caller_provider: BaseProvider | None = None,
+    require_authenticated_response: bool = False,
 ) -> dict[str, Any]:
     """Run the caller side end to end: verify the peer, prove holdership, seal, send.
 
@@ -128,16 +188,28 @@ def send_task(
     the callee learns what the caller is running as well as that it is the
     delegate. The two are independent, and the holder proof commits to the offer's
     channel key when one is sent, which is what ties the attested runtime and the
-    delegated principal into a single statement.
+    delegated principal into a single statement. The offer is minted in the
+    caller role, and the caller proves it holds the offer's channel private key
+    with a MAC over the request (``caller_possession``), so an offer relayed from
+    another enclave does not appraise (``ca2a-caller-offer-v2``).
 
     Returns the parsed response body on acceptance. Raises a :class:`CA2AError`
     carrying the peer's error code and message on any peer-side failure.
+
+    ``require_hardware=True`` rejects software-only offers before sealing or
+    sending a task. Configure the verifier's measurement and platform policy
+    separately; hardware assurance alone does not specify either requirement.
+
+    ``require_authenticated_response=True`` uses the one-use session-MAC profile
+    and rejects legacy/unsigned responses. Success carries locally established
+    ``response_authentication`` metadata. This is not a portable signature.
     """
     sealed: bytes | None = None
     caller_offer: ChannelOffer | None = None
+    caller_private_key: X25519PrivateKey | None = None
     # Always: the holder proof needs the callee's identity as its audience and a
     # challenge the callee issued, and both arrive in this one round trip.
-    hello = handshake(base_url, verifier=verifier)
+    hello = handshake(base_url, verifier=verifier, require_hardware=require_hardware)
     if hello.challenge is None:
         raise AttestationFailed(
             "the peer issued no challenge, so the caller cannot prove it holds the leaf key",
@@ -146,12 +218,11 @@ def send_task(
     if payload is not None:
         sealed = seal_to_peer(hello.peer, payload)
     if caller_provider is not None:
-        # The private half goes unused today: response sealing was withdrawn
-        # because nothing confidential comes back (the response is the
-        # provenance record, which has to stay readable). The key's job here
-        # is to be what the report binds, which is what makes the caller's
-        # measurement live rather than replayed.
-        _caller_private_key, caller_offer = offer_channel(caller_provider, nonce=hello.challenge)
+        # The report binds the public half; the private half proves possession
+        # below, which is what stops a relayed offer from appraising.
+        caller_private_key, caller_offer = offer_channel(
+            caller_provider, nonce=hello.challenge, role=ROLE_CALLER
+        )
 
     # After sealing and after the offer, because the proof commits to both.
     holder_proof = build_holder_proof(
@@ -165,6 +236,25 @@ def send_task(
         caller_channel_key=(None if caller_offer is None else caller_offer.channel_public_key),
         parent_record_hash=parent_record_hash,
     )
+    caller_possession = None
+    if caller_offer is not None and caller_private_key is not None:
+        # Last, because the transcript commits to the holder proof's signature.
+        caller_possession = prove_caller_possession(
+            caller_private_key,
+            callee_channel_key=hello.peer.public_key,
+            transcript=caller_possession_transcript(
+                challenge=hello.challenge,
+                callee_channel_key=hello.peer.public_key,
+                caller_channel_key=caller_offer.channel_public_key,
+                credential_id=chain[-1].credential_id,
+                subject=chain[-1].subject,
+                requested_capability=requested_capability,
+                record_id=record_id,
+                sealed_payload=sealed,
+                parent_record_hash=parent_record_hash,
+                holder_proof_signature=holder_proof.signature,
+            ),
+        )
     request = PeerRequest(
         chain=chain,
         requested_capability=requested_capability,
@@ -173,12 +263,30 @@ def send_task(
         parent_record_hash=parent_record_hash,
         caller_offer=caller_offer,
         holder_proof=holder_proof,
+        caller_possession=caller_possession,
     )
     message = a2a_adapter.attach_ca2a_metadata({}, request)
+    if require_authenticated_response:
+        pending = PendingResponse(hello.peer, message)
+        try:
+            status, raw = _post_authenticated(
+                f"{base_url}{AUTHENTICATED_TASK_PATH}", pending.request_bytes
+            )
+            response = pending.verify(status, raw)
+        except (OSError, http.client.HTTPException, TransportError) as exc:
+            raise ResponseAuthenticationFailed(
+                "no authenticated response; execution outcome is unknown"
+            ) from exc
+        if response.status != 200:
+            raise AuthenticatedPeerError(response)
+        return {**response.body, "response_authentication": response.authentication()}
     status, body = _post_json(f"{base_url}{TASK_PATH}", message)
     if status != 200:
         err = body.get("error", {})
         raise _rehydrate_error(err)
+    # Only local verification may attach this metadata. A legacy peer cannot
+    # manufacture assurance by returning the reserved field itself.
+    body.pop("response_authentication", None)
     return body
 
 

@@ -29,7 +29,7 @@ Out of scope: the A2A transport itself, agent identity issuance beyond delegatio
 
 Upon host organization acceptance, governance transitions from the current Project Lead model to a Technical Steering Committee (TSC).
 
-**Composition**: 3-7 members. No single organization may hold more than 40% of TSC seats. The founding Project Lead (Imran Siddique, OPAQUE Systems) holds one founding seat for the v1.0 release cycle.
+**Composition**: 3-7 members. No single organization may hold more than 40% of TSC seats. The founding Project Lead (Imran Siddique) holds one founding seat for the v1.0 release cycle.
 
 **Election**: TSC members are elected annually by active contributors (at least one merged pull request in the preceding 12 months). Each contributor has one vote.
 
@@ -44,11 +44,11 @@ Upon host organization acceptance, governance transitions from the current Proje
 
 ## 4. Intellectual Property Policy
 
-All contributions must be made under the terms of [LICENSE](LICENSE). Contributors must sign commits with the Developer Certificate of Origin (DCO). No contribution may incorporate material covered by a patent the contributor is unwilling to license royalty-free to conforming implementations.
+All contributions must be made under the terms of [LICENSE](https://github.com/agentrust-io/ca2a/blob/main/LICENSE). Contributors must sign commits with the Developer Certificate of Origin (DCO). No contribution may incorporate material covered by a patent the contributor is unwilling to license royalty-free to conforming implementations.
 
 ## 5. Trademark Policy
 
-"cA2A" and "cA2A-compatible" as project and conformance marks are currently held by OPAQUE Systems, Inc. Upon host organization acceptance, trademark ownership transfers to AAIF under their standard trademark policy.
+"cA2A" and "cA2A-compatible" as project and conformance marks are currently held by the founding maintainer. Upon host organization acceptance, trademark ownership transfers to AAIF under their standard trademark policy.
 
 Use of "cA2A-compatible" to describe a deployment requires that the implementation satisfies the attestation, attenuation, and provenance requirements defined in the project documentation for the version being claimed.
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ca2a-runtime"
-version = "0.2.1"
+version = "0.4.0"
 description = "Confidential agent-to-agent runtime: attested, attenuated delegation and sealed peer channels for A2A"
 readme = "README.md"
 license = { text = "MIT" }
@@ -26,7 +26,7 @@ requires-python = ">=3.11"
 dependencies = [
     "cryptography>=50.0",
     "pyyaml>=6.0",
-    "cedarpy==4.8.7",
+    "cedarpy==4.12.2",
     # TRACE record models + RFC 8785 signing, reused rather than reimplemented
     # (see ROADMAP Tier 0). Pin a compatible minor; cross-repo skew is a known
     # risk documented in LIMITATIONS.md.
@@ -60,10 +60,11 @@ dev = [
     "bandit[toml]>=1.7",
     "pip-audit>=2.6",
     # Conformance suite: asserts emitted records pass the TRACE Level checks.
-    "agentrust-trace-tests>=0.4,<0.6",
-    # So tests/unit/test_a2a_sdk_bridge.py runs in CI rather than skipping. A
-    # bridge whose tests only ever skip is a bridge nobody has exercised.
-    "a2a-sdk>=1.1,<2",
+    "agentrust-trace-tests>=0.4,<0.7",
+    # The bridge and real HTTP loopback run in the normal CI matrix. Pin the
+    # tested SDK/server surface here; the public a2a-sdk extra remains a range.
+    "a2a-sdk[http-server]==1.2.2",
+    "uvicorn==0.54.0",
     "aiohttp>=3.14.3",
 ]
 

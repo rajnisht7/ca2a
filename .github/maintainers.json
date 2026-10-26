@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "repository": "ca2a",
+  "source": "agentrust-io/.github:maintainers/roster.json",
+  "maintainers": [
+    "imran-siddique",
+    "carloshvp",
+    "zohebk8s"
+  ],
+  "security_paths": [
+    "src/ca2a_runtime/delegation/",
+    "src/ca2a_runtime/channel/",
+    "src/ca2a_runtime/tee/",
+    "src/ca2a_verify/"
+  ],
+  "security_approvals": 2
+}

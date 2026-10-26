@@ -53,6 +53,7 @@ from ca2a_runtime.policy import LocalPolicy  # noqa: E402
 from ca2a_runtime.tee.base import AttestationReport  # noqa: E402
 from ca2a_runtime.transport import a2a_sdk  # noqa: E402
 from ca2a_runtime.transport.constants import EXTENSION_URI  # noqa: E402
+from tests.unit.conftest import caller_offer, with_possession  # noqa: E402
 
 
 def _chain_with_keys(hops: int = 1) -> tuple[list[DelegationCredential], Ed25519PrivateKey]:
@@ -452,6 +453,52 @@ def test_attach_declares_the_extension_on_the_message() -> None:
     assert list(message.extensions).count(EXTENSION_URI) == 1
 
 
+def test_reused_message_clears_a_stale_sealed_payload() -> None:
+    """A reused SDK message must not carry a prior request's sealed ciphertext.
+
+    ``attach_to_sdk_message`` mutates in place, so an application that reuses one
+    ``Message`` across tasks would otherwise ship task N-1's ``sealed_payload`` as
+    task N's: cross-request payload confusion.
+    """
+    message = Message(message_id="m1")
+    a2a_sdk.attach_to_sdk_message(message, _request(sealed_payload=b"SECRET"))
+    a2a_sdk.attach_to_sdk_message(message, _request())
+    parsed = a2a_sdk.parse_sdk_message(message)
+    assert parsed is not None
+    assert parsed.sealed_payload is None
+
+
+def test_reused_message_clears_a_stale_caller_offer() -> None:
+    """A reused SDK message must not carry a prior request's caller offer."""
+    offer = ChannelOffer(
+        channel_public_key="k" * 43,
+        report=AttestationReport(
+            platform="software-only",
+            measurement="m",
+            public_key="k" * 43,
+            nonce="v1.123.abc.def",
+        ),
+    )
+    message = Message(message_id="m1")
+    a2a_sdk.attach_to_sdk_message(message, _request(caller_offer=offer))
+    a2a_sdk.attach_to_sdk_message(message, _request())
+    parsed = a2a_sdk.parse_sdk_message(message)
+    assert parsed is not None
+    assert parsed.caller_offer is None
+
+
+def test_reused_message_clears_a_stale_holder_proof() -> None:
+    """A reused SDK message must not carry a prior request's holder proof."""
+    chain, leaf_key = _chain_with_keys()
+    node = PeerNode(LocalPolicy.of({"read"}), trusted_root_issuers={chain[0].issuer})
+    message = Message(message_id="m1")
+    a2a_sdk.attach_to_sdk_message(message, _request(node=node, chain=chain, leaf_key=leaf_key))
+    a2a_sdk.attach_to_sdk_message(message, _request())
+    parsed = a2a_sdk.parse_sdk_message(message)
+    assert parsed is not None
+    assert parsed.holder_proof is None
+
+
 # --------------------------------------------------------------------------
 # Not-a-cA2A-message, and failing closed
 # --------------------------------------------------------------------------
@@ -520,18 +567,12 @@ def test_mutual_attestation_works_over_the_sdk_bridge() -> None:
         trusted_root_issuers={chain[0].issuer},
     )
     challenge = node.issue_challenge()
-    offer = ChannelOffer(
-        channel_public_key="k" * 43,
-        report=AttestationReport(
-            platform="software-only",
-            measurement="caller",
-            public_key="k" * 43,
-            nonce=challenge,
-        ),
-    )
-    message = a2a_sdk.attach_to_sdk_message(
-        Message(message_id="m1"),
+    caller_key, offer = caller_offer(challenge, measurement="caller")
+    request = with_possession(
         _request(caller_offer=offer, node=node, chain=chain, leaf_key=leaf_key),
+        caller_key,
+        node.channel_public_key,
     )
+    message = a2a_sdk.attach_to_sdk_message(Message(message_id="m1"), request)
     result = node.handle({"metadata": a2a_sdk.metadata_from_sdk_message(message)})
     assert result.caller_attestation == "software-only"

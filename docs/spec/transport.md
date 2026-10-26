@@ -1,5 +1,7 @@
 # Transport Binding
 
+This page explains how cA2A's extra fields travel inside ordinary A2A messages without changing A2A itself, and lists which parts of that are built today. It is for developers connecting cA2A to an A2A server or client.
+
 cA2A is a profile on A2A, not a competing transport. A2A moves tasks and context between agents and authenticates a peer's domain with the Signed Agent Card. cA2A adds a trust envelope around a delegated task and leaves the wire protocol untouched. This page states how the profile attaches to the transport and what a peer does with the attached data. For the higher-level statement of what the profile adds and where, see [the A2A profile binding](profile.md).
 
 ## What ships today versus what does not
@@ -97,13 +99,18 @@ Namespaced keys on A2A `metadata` (message and/or params):
 | `https://agentrust-io.com/extensions/ca2a/v0.1/record_id` | string | Provenance record id for this hop |
 | `https://agentrust-io.com/extensions/ca2a/v0.1/parent_record_hash` | string or `null` | Parent TRACE/provenance hash; `null` for a root hop |
 | `https://agentrust-io.com/extensions/ca2a/v0.1/sealed_payload` | string (base64url) or omitted | Opaque sealed ciphertext only, not a verified measurement binding |
-| `https://agentrust-io.com/extensions/ca2a/v0.1/caller_offer` | channel-offer object or omitted | The caller's own attested channel key, bound to a challenge the callee issued ([mutual attestation](mutual-attestation.md)) |
+| `https://agentrust-io.com/extensions/ca2a/v0.1/caller_offer` | channel-offer object or omitted | The caller's own attested channel key, bound to a challenge the callee issued, with `attestation.role` set to `"caller"` ([mutual attestation](mutual-attestation.md)) |
+| `https://agentrust-io.com/extensions/ca2a/v0.1/caller_possession` | `{"version": "ca2a-caller-offer-v2", "mac": <hex>}` or omitted | The caller's proof that it holds the private half of `caller_offer`'s channel key. Required whenever `caller_offer` is present |
 
 `caller_offer` is **optional**, unlike `parent_record_hash`: a caller that cannot
 attest omits the key entirely rather than sending `null`, and a callee serves it
 by default. A key that is present but is not a well-formed offer is malformed and
 fails closed, so a caller cannot get itself treated as unattested by sending
-rubbish. Its object shape is the same one the handshake endpoint returns.
+rubbish. Its object shape is the same one the handshake endpoint returns, plus
+`attestation.role: "caller"`. The handshake endpoint omits `role`, which reads as
+`"callee"`, and a callee refuses a callee-role offer presented as `caller_offer`.
+An offer without `caller_possession`, or whose proof does not verify, is refused
+([mutual attestation](mutual-attestation.md)).
 
 Constants and helpers live in `ca2a_runtime.transport`.
 
@@ -158,7 +165,7 @@ message = attach_ca2a_metadata(message, request)
 
 ## Running the reference transport
 
-A library caller builds a `PeerNode` and hands it to `ca2a_runtime.transport.server.serve`. `ca2a start` is the same thing driven from a config file: it resolves the policy (`local_policy` or a Cedar `policy_bundle_path`) and the attestation provider, builds the node, and binds `listen_addr`.
+A library caller builds a `PeerNode` and hands it to `ca2a_runtime.transport.server.serve`. `ca2a start` is the same thing driven from a config file: it resolves the policy (`local_policy` or a Cedar `policy_bundle_path`), the attestation provider, and the caller-appraisal posture (`require_caller_attestation` and, where one can be built, a `caller_verifier`), builds the node, and binds `listen_addr`.
 
 ```bash
 ca2a start --config examples/minimal/ca2a-config.yaml

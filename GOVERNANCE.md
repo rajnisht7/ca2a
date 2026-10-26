@@ -8,7 +8,7 @@ This document describes how cA2A is governed: who holds what role, how decisions
 
 AAIF hosting for cA2A is **proposed, not accepted**. [CHARTER.md](CHARTER.md) is the
 authoritative record: it is a pre-acceptance draft, the AAIF project proposal is targeted for
-Q4 2026, and the "cA2A" and "cA2A-compatible" marks are currently held by OPAQUE Systems, Inc.
+Q4 2026, and the "cA2A" and "cA2A-compatible" marks are currently held by the founding maintainer.
 
 On acceptance the Foundation would set overall direction for the agentrust-io ecosystem, hold
 the project's trademarks, and provide a neutral venue for resolving disputes that cannot be
@@ -24,7 +24,7 @@ The project lead is responsible for the technical direction of cA2A, final say o
 
 | Name | Affiliation | GitHub |
 |------|-------------|--------|
-| Imran Siddique | OPAQUE Systems | @imran-siddique |
+| Imran Siddique | AgenTrust-io | @imran-siddique |
 
 The project lead role is subject to Foundation confirmation. Succession is decided by a 2/3 maintainer vote, ratified by the Foundation.
 
@@ -86,3 +86,11 @@ Where the dispute involves the project lead, there is currently no external venu
 ## Amendments
 
 Changes to this document require an explicit vote (see above). Ratification by the Agentic AI Foundation becomes an additional requirement only once AAIF hosting is accepted; requiring it today would make this document unamendable, since there is no Foundation relationship to ratify through.
+
+## Disclosures
+
+Mohammed Zoheb Shaik (@zohebk8s) has disclosed that he builds Custodian, a key broker for model weights that uses the Weight Custody Manifest SDK as a dependency rather than a fork.
+
+He will note this interest on relevant proposals and reviews, recuse where Custodian's own design is the question, and update the disclosure if the interest changes materially. Custodian is neither endorsed by this project nor its reference implementation. This disclosure does not grant a project role or change existing decision rights or conflict-of-interest requirements.
+
+Source: [commercial-interest disclosure](https://github.com/agentrust-io/ca2a/issues/163).

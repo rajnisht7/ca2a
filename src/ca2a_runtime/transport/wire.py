@@ -16,6 +16,17 @@ from ca2a_runtime.errors import CA2AError, TransportError
 from ca2a_runtime.peer import PeerResult
 from ca2a_runtime.provenance import DelegationRecord
 from ca2a_runtime.tee.base import AttestationReport
+from ca2a_runtime.tee.binding import ROLE_CALLEE, ROLES
+from ca2a_runtime.transport._b64url import b64url_decode, b64url_encode
+
+_CLAIM_FIELDS = ("platform", "measurement", "public_key", "nonce")
+
+_EVIDENCE_FIELDS = (
+    "raw_evidence",
+    "quote_signature",
+    "attestation_key_pem",
+    "attestation_key_chain_pem",
+)
 
 
 def _record_to_dict(record: DelegationRecord) -> dict[str, Any]:
@@ -65,15 +76,31 @@ def serialize_channel_offer(offer: ChannelOffer, *, challenge: str | None = None
     ``challenge`` is the callee's half of a mutual exchange and is omitted when
     the callee issues none, so an older caller sees exactly the response it saw
     before. A caller that does not understand the field simply does not attest.
+
+    The report's evidence fields (``raw_evidence``, ``quote_signature``,
+    ``attestation_key_pem``, ``attestation_key_chain_pem``) are base64url-encoded
+    and included when present. Without them a hardware report cannot reach a
+    remote peer's ``Verifier`` at all: it fails closed with a misleading "no
+    quote to verify" rather than actually being appraised, even though the local
+    provider produced genuine evidence. They are omitted entirely (not sent as
+    null) when absent, so a software-only offer's JSON is byte-for-byte the same
+    as before this field existed.
+
+    ``role`` is included only for a caller-role offer. A callee offer omits it
+    and a parser reads its absence as ``callee``, so a handshake response is
+    byte-for-byte what it was before roles existed, and a pre-v2 caller offer
+    (which has no role) parses as a callee offer and is refused as one.
     """
+    attestation: dict[str, Any] = {field: getattr(offer.report, field) for field in _CLAIM_FIELDS}
+    if offer.report.role != ROLE_CALLEE:
+        attestation["role"] = offer.report.role
+    for field in _EVIDENCE_FIELDS:
+        value = getattr(offer.report, field)
+        if value is not None:
+            attestation[field] = b64url_encode(value)
     body: dict[str, Any] = {
         "channel_public_key": offer.channel_public_key,
-        "attestation": {
-            "platform": offer.report.platform,
-            "measurement": offer.report.measurement,
-            "public_key": offer.report.public_key,
-            "nonce": offer.report.nonce,
-        },
+        "attestation": attestation,
     }
     if challenge is not None:
         body["challenge"] = challenge
@@ -89,13 +116,21 @@ def parse_channel_offer(data: dict[str, Any]) -> ChannelOffer:
     try:
         public_key = str(data["channel_public_key"])
         att = data["attestation"]
+        evidence = {
+            field: b64url_decode(field, att[field]) for field in _EVIDENCE_FIELDS if field in att
+        }
+        role = att.get("role", ROLE_CALLEE)
+        if role not in ROLES:
+            raise TransportError("malformed channel offer", detail=f"unknown offer role {role!r}")
         report = AttestationReport(
             platform=str(att["platform"]),
             measurement=str(att["measurement"]),
             public_key=str(att["public_key"]),
             nonce=str(att["nonce"]),
+            role=role,
+            **evidence,
         )
-    except (KeyError, TypeError) as exc:
+    except (KeyError, TypeError, AttributeError) as exc:
         raise TransportError("malformed channel offer", detail=str(exc)) from exc
     return ChannelOffer(channel_public_key=public_key, report=report)
 

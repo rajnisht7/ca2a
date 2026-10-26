@@ -1,5 +1,7 @@
 # Peer Attestation
 
+Attestation is a report signed by the processor that says what software a machine is running. This page specifies how a cA2A agent produces such a report for TPM, AMD SEV-SNP and Intel TDX hardware, ties its encryption key to it, and how the other side checks it. It is for implementers and security reviewers; for a plain overview read [How It Works](../concepts.md).
+
 Before a peer is trusted with a delegated task, it proves it is running attested, measured code. cA2A reuses the pluggable TEE provider abstraction from [cmcp](https://github.com/agentrust-io/cmcp).
 
 ## Provider interface
@@ -23,13 +25,20 @@ binding = sha256(prefix || len32(public_key) || public_key || len32(nonce) || no
 | AMD SEV-SNP | `ca2a-snp-v1\|` | `REPORT_DATA` (64 bytes) | the binding, zero-padded on the right |
 | Intel TDX | `ca2a-tdx-v1\|` | `REPORTDATA` (64 bytes) | the binding, zero-padded on the right |
 
+Those are the **callee-role** prefixes: what the handshake endpoint signs. A caller
+offer (see [mutual attestation](mutual-attestation.md)) is signed under its own
+prefix per platform, `ca2a-tpm-caller-v2|`, `ca2a-snp-caller-v2|` and
+`ca2a-tdx-caller-v2|`, selected by the report's `role`. A verifier MUST derive the
+binding under the report's role, so an offer relabelled from one role to the other
+recomputes different bytes and is rejected.
+
 Committing the nonce alone would sign for freshness only, leaving `public_key` an unsigned assertion, so sealing a payload "to a key from a verified report" would not actually be rooted in hardware. A verifier re-derives this value from the report's own fields and requires equality, which is what promotes `public_key` and `nonce` from claim to signed fact. A report whose key was substituted after collection is rejected.
 
 Three encoding details are load-bearing, and each prefix is versioned because this is wire format: a peer and its verifier MUST derive identical bytes.
 
 - **Hashed, not raw.** `TPM2B_DATA` is capped below 64 bytes on some platforms (Azure returns `TPM_RC_SIZE`), and 32 bytes always fits. SEV-SNP and TDX reserve 64, so the digest is left-aligned and zero-padded, which is the convention the kernel's own callers and `agent-manifest` use; a report collected by either runtime is then byte-comparable.
 - **Length-prefixed, not delimiter-joined.** With a delimiter a value containing it shifts the split without changing the digest, so `("a|b", "c")` and `("a", "b|c")` would commit identical bytes and a peer could bind a key other than the one it appears to offer. `nonce` is an arbitrary caller-supplied string, so that is reachable rather than theoretical.
-- **Domain-separated per platform.** The three prefixes differ so a report collected on one platform cannot be replayed as another's evidence.
+- **Domain-separated per platform and per role.** The prefixes differ so a report collected on one platform cannot be replayed as another's evidence, and so a callee offer, which anybody can obtain from the public handshake endpoint under a nonce of their choosing, cannot be presented as a caller offer.
 
 `ca2a_runtime.tee.binding` holds the single derivation the three providers share.
 
@@ -54,7 +63,6 @@ All four are absent on `software-only`, which has no evidence by construction. A
 | `sev-snp` | AMD SEV-SNP | Verifier and collector both implemented (see below). `attest` produces a real report on a non-paravisor SNP guest through configfs-TSM. |
 | `tdx` | Intel TDX | Verifier and collector both implemented (see below). `attest` produces a real DCAP quote on a TDX guest through configfs-TSM. |
 | `tpm` | TPM 2.0 / vTPM | Verifier and collector both implemented (see below). `attest` produces a real quote on a Linux host with a TPM and tpm2-pytss. |
-| `opaque` | OPAQUE Confidential Runtime | Tier 3, explicit opt-in, not auto-selected |
 
 ## SEV-SNP verification
 
@@ -92,9 +100,9 @@ The collector has **not** been run on real TDX silicon. It is exercised against 
 
 ## TPM verification
 
-`ca2a_verify.tpm.verify_tpm_report` appraises a peer's TPM report offline: the AK certificate chain is verified to a trusted root, the AK signature over the attest blob is verified (ECDSA-SHA256 or RSA PKCS#1 v1.5), the structure is confirmed to be a TPM-generated quote (magic and type), and the key-and-nonce binding below is checked. `verify_tpm_quote` is the lower-level form taking an attest blob and a bare signature directly.
+`ca2a_verify.tpm.verify_tpm_report` appraises a peer's TPM report offline: the AK certificate chain is verified to a trusted root, the AK signature over the `TPMS_ATTEST` blob is verified using the signature scheme and digest declared by the marshalled `TPMT_SIGNATURE`, the structure is confirmed to be a TPM-generated quote (magic and type), and the key-and-nonce binding below is checked. The released shared verifier supports ECDSA, RSASSA, and RSAPSS with SHA-256, SHA-384, or SHA-512. `verify_tpm_quote` is the lower-level compatibility form taking an attest blob plus either parsed signature metadata or a legacy bare signature. At this cA2A boundary a `bytes` value means only the legacy form: cA2A explicitly tags it as ECDSA/SHA-256 or RSASSA/SHA-256 according to the AK public-key type before delegation. This avoids guessing whether arbitrary signature-prefix bytes are a `TPMT_SIGNATURE` header. Callers holding a marshalled `TPMT_SIGNATURE` must use `parse_tpmt_signature()` first.
 
-The cryptography is not implemented in cA2A. Steps 1, 2 and 4 delegate to `agent_manifest.verify_tpm_quote`, the canonical hardware-validated implementation cA2A already depends on; three divergent copies of one TPM verifier is the problem being retired (cmcp#447). What cA2A keeps is the piece agent-manifest does not model: `TPMT_SIGNATURE`, the envelope `tpm2_quote -s` and tpm2-pytss `signature.marshal()` actually emit, which is unwrapped to the bare signature agent-manifest takes.
+The cryptography is not implemented in cA2A. Steps 1, 2 and 4 delegate to `agent_manifest.verify_tpm_quote`, the canonical hardware-validated implementation cA2A already depends on; three divergent copies of one TPM verifier is the problem being retired (cmcp#447). cA2A delegates parsing of the `TPMT_SIGNATURE` emitted by `tpm2_quote -s` and `tpm2-pytss`'s `signature.marshal()` to Agent Manifest too, then passes the complete parsed result to quote verification. The scheme and digest declarations are outside the signed `TPMS_ATTEST` bytes, but they select the verification operation: relabelling either one without producing a matching signature fails. This establishes algorithm consistency, not a deployment policy about which supported algorithms are sufficiently strong.
 
 ### What the quote measures
 
@@ -112,7 +120,7 @@ TPM attestation keys chain to per-vendor roots, not to one published root the wa
 
 cmcp falls back to the SHA-1 PCR bank and downgrades the report to `software-only`; cA2A requires the SHA-256 bank and raises instead, because a report labelled `sha256:` that measured SHA-1 banks is a mislabel waiting to happen. cmcp can also emit a report whose only evidence is an unsigned PCR read, marked software-only; in cA2A, failing to produce a signed quote raises, because the platform string on a cA2A report is the provider's identity and a `tpm` report that can never verify is worse than an honest error.
 
-What is validated. The collector's checks, the TPM interaction shapes, and report verification end to end are exercised against synthetic self-consistent vectors in `tests/unit/test_tpm_attest.py`. On a real Azure Trusted Launch vTPM (2026-08-01) the collector produced a genuine platform-AK quote, `parse_tpmt_signature` unwrapped the real `TPMT_SIGNATURE` (RSASSA/SHA-256) and the bare signature verified against the shipped key, a tampered attest blob was rejected, and the quote's `extraData` equalled the derived key-and-nonce binding. Collector and verifier ran in one process, which retires the earlier tooling caveat.
+What is validated. The collector's checks, the TPM interaction shapes, and report verification end to end are exercised against synthetic self-consistent vectors in `tests/unit/test_tpm_attest.py`. Those vectors cover a valid RSAPSS/SHA-384 report and reject RSASSA/SHA-256 signatures falsely declared as either RSAPSS or SHA-384, both directly and through the reference wire and offer-verification path. On a real Azure Trusted Launch vTPM (2026-08-01) the collector produced a genuine platform-AK quote, `parse_tpmt_signature` parsed the real `TPMT_SIGNATURE` (RSASSA/SHA-256), the signature verified against the shipped key, a tampered attest blob was rejected, and the quote's `extraData` equalled the derived key-and-nonce binding. Collector and verifier ran in one process, which retires the earlier tooling caveat. The new non-default algorithm cases are synthetic; they do not claim a live hardware RSAPSS/SHA-384 run.
 
 Chained verification did **not** pass on that host, because its AK certificate carries no AIA extension and so no chain can be assembled. That is a property of the host, not a defect in the verifier, and it is recorded in [LIMITATIONS.md](../../LIMITATIONS.md).
 

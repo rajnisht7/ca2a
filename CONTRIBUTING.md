@@ -1,10 +1,28 @@
 # Contributing to cA2A
 
+AgenTrust is an independent open-source project. No company funds, owns or directs it; contributions are voluntary.
+
 Thank you for contributing. This document covers everything you need to get started.
 
 ## Before you start
 
 cA2A is a confidential delegation profile on top of A2A. Changes to the delegation chain, sealed channel, attestation path, or TRACE record generation require extra care: these are security-critical components. When in doubt, open an issue first.
+
+## Using AI to contribute
+
+Use agents. A lot of this was built with them and saying otherwise would be dishonest.
+
+The rule is that you have to understand what you submit. If you cannot explain what your change does and how it interacts with the rest of the system, with the agent closed, do not open the pull request. Reviewing a change nobody can explain costs more than writing it did, and it becomes someone else's problem the moment it merges.
+
+That is a rule about understanding, not about tooling.
+
+## Being vouched
+
+If you have not contributed here before, ask before you build. Open an issue saying what you want to change and why, in your own words. A maintainer will reply and add you with `/vouch`, and after that your pull requests go through the normal review.
+
+A pull request from an account that has not been vouched is closed automatically, with a comment pointing back here. That is not a judgement about you or about the change. It exists because agent-written contributions are cheap to produce and expensive to review, and a short conversation first is better for both sides than a review neither of us can finish.
+
+Anyone who can already push, and anyone with a merged pull request here before this rule existed, is already vouched.
 
 ## Developer certificate of origin
 
@@ -36,6 +54,14 @@ pytest tests/unit/ -v                        # unit tests
 ```
 
 All four must pass before a PR is mergeable.
+
+### Release validation
+
+Release builds depend on a credential-free mirror of CI, including its Python 3.11,
+3.12 and 3.13 matrix on Linux and Windows. Failed, cancelled or skipped validation
+blocks the build and therefore publication. The existing wheel and source
+distribution installation checks still run before their artifacts are uploaded.
+`governance-release` remains a post-publication attestation attached to the release.
 
 ## Commit format
 
@@ -84,3 +110,8 @@ Do **not** open a public issue. Use [GitHub Security Advisories](https://github.
 ## Questions
 
 Open a [GitHub Discussion](https://github.com/orgs/agentrust-io/discussions) for design questions or proposals before writing code.
+
+The release validation workflow omits coverage upload and OIDC permission. A parity
+test requires every other CI job and step to match, preventing validation drift.
+Normal CI retains its coverage reporting; release events skip that upload. Only
+the separate publish job can request a release OIDC token.

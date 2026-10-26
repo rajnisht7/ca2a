@@ -45,3 +45,35 @@ def test_utf16_key_ordering() -> None:
 def test_float_rejected() -> None:
     with pytest.raises(TypeError):
         canonicalize({"x": 1.5})
+
+
+def test_integer_outside_safe_domain_rejected() -> None:
+    """RFC 8785 routes numbers through the ECMAScript double conversion.
+
+    That conversion maps 9007199254740992 and 9007199254740993 to the same
+    digits, so emitting a larger integer verbatim diverges from a conforming
+    verifier, and a verifier that does convert would accept one signature for
+    two distinct values. Floats are already refused here for the same reason;
+    this closes the integer half of it.
+    """
+    for n in (2**53, -(2**53), 2**53 + 1, 10**30):
+        with pytest.raises(ValueError, match="safe integer domain"):
+            canonicalize({"x": n})
+
+
+def test_safe_domain_boundary_accepted() -> None:
+    assert canonicalize({"x": 2**53 - 1}) == b'{"x":9007199254740991}'
+    assert canonicalize({"x": -(2**53 - 1)}) == b'{"x":-9007199254740991}'
+
+
+def test_non_string_object_keys_rejected() -> None:
+    """JSON object keys are strings; coercing them made one key appear twice.
+
+    ``str(1) == "1"``, so ``{1: "a", "1": "b"}`` used to serialize as
+    ``{"1":"a","1":"b"}``. A parser keeps one of the pair, so a field the
+    signature covered disappeared on the verifier's side. The rfc8785 reference
+    implementation refuses these inputs as well.
+    """
+    for value in ({1: "a", "1": "b"}, {True: 1}, {None: 1}, {"outer": {2: "x"}}):
+        with pytest.raises(TypeError, match="keys must be strings"):
+            canonicalize(value)

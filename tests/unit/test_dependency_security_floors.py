@@ -26,15 +26,52 @@ def test_a2a_sdk_extra_cannot_resolve_vulnerable_aiohttp() -> None:
 
 
 def test_docs_floor_excludes_vulnerable_pymdown_extensions() -> None:
+    # Compare parsed versions rather than the literal pin, so that raising the
+    # floor (which is always safer) does not fail this test. 11.0.1 is the first
+    # release without the advisory; anything at or above it is acceptable.
     requirements = Path("requirements-docs.txt").read_text(encoding="utf-8").splitlines()
-    assert "pymdown-extensions>=11.0.1" in requirements
+    pins = [line for line in requirements if line.startswith("pymdown-extensions>=")]
+    assert len(pins) == 1, f"expected exactly one pymdown-extensions floor, got {pins}"
+    floor = tuple(int(part) for part in pins[0].split(">=", 1)[1].strip().split("."))
+    assert floor >= (11, 0, 1)
 
 
 def test_governance_tooling_cannot_downgrade_runtime_dependencies() -> None:
+    """AGT stays in its own venv, and cryptography is lifted past its ceiling there.
+
+    AGT 4.1 declares cryptography>=46.0.7,<49.0 while this runtime requires
+    >=50.0, so the two genuinely cannot be resolved together. The invariant is
+    that the scanner never shares an environment with the package under test,
+    and that the override still happens inside the isolated venv.
+
+    Asserted against the lock files rather than the literal install lines, so
+    that pinning or re-pinning does not break a test about isolation.
+    """
     for workflow in ("ci.yml", "release.yml"):
         contents = Path(".github/workflows", workflow).read_text(encoding="utf-8")
         assert "python -m venv .agt-venv" in contents
-        assert '.agt-venv/bin/pip install "agent-governance-toolkit[full]>=4.1"' in contents
-        assert '.agt-venv/bin/pip install --upgrade --no-deps "cryptography>=50.0"' in contents
+        assert (
+            ".agt-venv/bin/pip install --require-hashes --no-deps -r requirements/agt.txt"
+        ) in contents
+        # AGT is never installed into the environment holding the package.
         assert 'pip install -e ".[dev]" "agent-governance-toolkit' not in contents
         assert 'pip install -e "." "agent-governance-toolkit' not in contents
+        assert "agent-governance-toolkit" not in contents.replace("requirements/agt.txt", "")
+
+
+def test_agt_lock_carries_no_cryptography_below_the_floor() -> None:
+    """The scanner lock is compiled with an override, so it must land at or above 50.
+
+    A lock that names a vulnerable cryptography is one Dependabot will flag
+    forever, even when install order means it never runs. Compiling the override
+    in keeps the vulnerable version out of the file entirely.
+    """
+    override = Path("requirements/agt.txt").read_text(encoding="utf-8")
+    pins = [
+        line.split("==", 1)[1].split()[0]
+        for line in override.splitlines()
+        if line.startswith("cryptography==")
+    ]
+    assert len(pins) == 1, f"expected exactly one cryptography pin, got {pins}"
+    floor = tuple(int(part) for part in pins[0].split("."))
+    assert floor >= (50, 0), floor

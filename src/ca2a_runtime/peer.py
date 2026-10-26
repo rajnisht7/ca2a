@@ -9,7 +9,8 @@ When a peer presents a delegation chain and requests a capability, the callee:
 3. computes the effective scope as the leaf's delegated scope intersected with
    the callee's local policy;
 4. appraises what the caller is *running*, if it offered an attestation bound to
-   a challenge this callee issued (see ``docs/spec/mutual-attestation.md``);
+   a challenge this callee issued, and requires the caller to prove it holds the
+   attested channel key (see ``docs/spec/mutual-attestation.md``);
 5. enforces: the requested capability must be in the effective scope;
 6. emits a provenance record for the accepted hop, linked to its parent.
 
@@ -41,10 +42,22 @@ from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-from ca2a_runtime.attestation import ChannelOffer, Verifier, appraise_caller
+from ca2a_runtime.attestation import (
+    CallerPossession,
+    ChannelOffer,
+    Verifier,
+    appraise_caller,
+    caller_possession_transcript,
+    verify_caller_possession,
+)
 from ca2a_runtime.channel import open_sealed
 from ca2a_runtime.delegation.credential import DelegationCredential, verify_chain
 from ca2a_runtime.delegation.holder import HolderProof, verify_holder_proof
+from ca2a_runtime.delegation.revocation import (
+    REVOCATION_NOT_CHECKED,
+    RevocationSnapshot,
+    RevocationStatus,
+)
 from ca2a_runtime.errors import (
     AttestationFailed,
     ConfigError,
@@ -91,12 +104,20 @@ def effective_scope(
     *,
     max_depth: int = 8,
     trusted_root_issuers: Collection[str] = (),
+    revocations: RevocationSnapshot | None = None,
+    max_revocation_staleness: int | None = None,
 ) -> frozenset[str]:
     """Verify the chain and return the effective scope (delegated ∩ local policy).
 
     Raises the relevant CA2AError if the chain does not verify.
     """
-    verify_chain(chain, max_depth=max_depth, trusted_root_issuers=trusted_root_issuers)
+    verify_chain(
+        chain,
+        max_depth=max_depth,
+        trusted_root_issuers=trusted_root_issuers,
+        revocations=revocations,
+        max_revocation_staleness=max_revocation_staleness,
+    )
     return policy.intersect(chain[-1].scope)
 
 
@@ -119,6 +140,8 @@ def enforce_peer_call(
     max_depth: int = 8,
     caller_attestation: str = CALLER_NOT_OFFERED,
     trusted_root_issuers: Collection[str] = (),
+    revocations: RevocationSnapshot | None = None,
+    max_revocation_staleness: int | None = None,
 ) -> PeerDecision:
     """Verify, intersect with local policy, enforce, and emit a provenance record.
 
@@ -136,6 +159,8 @@ def enforce_peer_call(
         policy,
         max_depth=max_depth,
         trusted_root_issuers=trusted_root_issuers,
+        revocations=revocations,
+        max_revocation_staleness=max_revocation_staleness,
     )
     return decide_capability(
         chain,
@@ -222,6 +247,11 @@ class PeerRequest:
     challenge this callee issued. Required by default, unlike ``caller_offer``:
     attesting a runtime is a capability not every caller has, but holding the key
     you were delegated is not optional -- it is what being the delegate means."""
+    caller_possession: CallerPossession | None = None
+    """The caller's proof that it holds the private half of ``caller_offer``'s
+    channel key, over this request's transcript. Required whenever
+    ``caller_offer`` is present: an offer alone shows some enclave holds the key,
+    not that the presenter is that enclave."""
 
 
 @dataclass(frozen=True)
@@ -235,6 +265,10 @@ class PeerResult:
     caller_attestation: str = CALLER_NOT_OFFERED
     """What the callee established about the caller's runtime. Also on ``record``,
     where it is part of the portable evidence rather than just this return value."""
+    revocation: RevocationStatus = REVOCATION_NOT_CHECKED
+    """Whether the chain was checked against a revocation snapshot. ``checked`` is
+    False when the callee was given none, in which case a revoked chain would
+    have been accepted."""
 
 
 def appraise_caller_runtime(
@@ -244,8 +278,13 @@ def appraise_caller_runtime(
     requirement: str = REQUIRE_NONE,
     challenge_secret: bytes | None = None,
     caller_verifier: Verifier | None = None,
+    callee_private_key: X25519PrivateKey | None = None,
 ) -> str:
     """Appraise the caller's offer and return the recorded outcome, or refuse.
+
+    ``callee_private_key`` is this callee's channel private key, the other half
+    of the key the caller's proof of possession is derived from. Without it no
+    offer can be accepted, so a present offer is refused rather than recorded.
 
     Returns one of the ``CALLER_*`` values. Raises :class:`AttestationFailed`,
     carrying a linked denial record, when the caller does not meet
@@ -275,6 +314,14 @@ def appraise_caller_runtime(
         )
 
     if request.caller_offer is None:
+        if request.caller_possession is not None:
+            # A proof of possession for no offer is not something a conforming
+            # caller sends. Refused, so a malformed request is never read as an
+            # unattested one.
+            raise refuse(
+                "a caller proof of possession was sent without a caller offer",
+                outcome=CALLER_FAILED,
+            )
         if requirement == REQUIRE_NONE:
             return CALLER_NOT_OFFERED
         raise refuse(
@@ -303,6 +350,42 @@ def appraise_caller_runtime(
     except AttestationFailed as exc:
         raise refuse(
             f"the caller's attestation did not appraise: {exc}",
+            outcome=CALLER_FAILED,
+            detail=exc.detail,
+        ) from exc
+
+    # The offer says an enclave with this measurement holds the key. The proof
+    # of possession says the party presenting the offer is that enclave: without
+    # it, anyone could relay an honest peer's offer and be recorded as hardware.
+    if callee_private_key is None:
+        raise refuse(
+            "the caller offered an attestation but this callee has no channel key "
+            "to check its proof of possession against",
+            outcome=CALLER_FAILED,
+        )
+    offer = request.caller_offer
+    try:
+        verify_caller_possession(
+            request.caller_possession,
+            callee_private_key=callee_private_key,
+            transcript=caller_possession_transcript(
+                challenge=offer.report.nonce,
+                callee_channel_key=callee_private_key.public_key().public_bytes_raw().hex(),
+                caller_channel_key=offer.report.public_key,
+                credential_id=request.chain[-1].credential_id,
+                subject=request.chain[-1].subject,
+                requested_capability=request.requested_capability,
+                record_id=request.record_id,
+                sealed_payload=request.sealed_payload,
+                parent_record_hash=request.parent_record_hash,
+                holder_proof_signature=(
+                    None if request.holder_proof is None else request.holder_proof.signature
+                ),
+            ),
+        )
+    except AttestationFailed as exc:
+        raise refuse(
+            f"the caller's proof of possession did not verify: {exc}",
             outcome=CALLER_FAILED,
             detail=exc.detail,
         ) from exc
@@ -380,6 +463,8 @@ def handle_peer_request(
     audience: str | None = None,
     require_holder_proof: bool = True,
     trusted_root_issuers: Collection[str] = (),
+    revocations: RevocationSnapshot | None = None,
+    max_revocation_staleness: int | None = None,
 ) -> PeerResult:
     """Run the full inbound pipeline for a parsed peer request.
 
@@ -408,16 +493,24 @@ def handle_peer_request(
     leaf's authority; it exists for offline replay of recorded evidence, where
     there is no live caller to challenge, and must not be used on a live peer
     path.
+
+    ``revocations`` is the callee's current revocation snapshot, if it has one;
+    a chain with a revoked hop is then refused with ``CREDENTIAL_REVOKED`` before
+    the caller is challenged. ``max_revocation_staleness`` makes a snapshot of at
+    most that age mandatory. Without either, revocation is not checked and the
+    returned ``PeerResult.revocation`` says so.
     """
     # The chain, trust set included, is verified exactly once: here, before the
     # caller is challenged, so an untrusted or malformed chain is refused before
     # a proof is demanded about a credential this peer was never going to honour.
     # The scope intersection below reads the leaf of this verified chain, so it
     # does not verify it again.
-    verify_chain(
+    revocation = verify_chain(
         request.chain,
         max_depth=max_depth,
         trusted_root_issuers=trusted_root_issuers,
+        revocations=revocations,
+        max_revocation_staleness=max_revocation_staleness,
     )
     if require_holder_proof:
         # Before the scope intersection, so an unauthenticated caller never
@@ -436,6 +529,7 @@ def handle_peer_request(
         requirement=require_caller_attestation,
         challenge_secret=challenge_secret,
         caller_verifier=caller_verifier,
+        callee_private_key=enclave_private_key,
     )
 
     decision = decide_capability(
@@ -459,4 +553,5 @@ def handle_peer_request(
         record=decision.record,
         payload=payload,
         caller_attestation=caller_attestation,
+        revocation=revocation,
     )

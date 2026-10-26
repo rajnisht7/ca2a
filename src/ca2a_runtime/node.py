@@ -12,14 +12,15 @@ transport-agnostic; :mod:`ca2a_runtime.transport.server` wraps it over HTTP.
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from typing import Any
 
 from ca2a_runtime.agent_manifest import AgentManifestBinding
 from ca2a_runtime.attestation import ChannelOffer, Verifier, attest_channel
 from ca2a_runtime.challenge import DEFAULT_TTL_SECONDS, generate_secret, issue_challenge
 from ca2a_runtime.channel import generate_channel_keypair
-from ca2a_runtime.errors import ConfigError, TransportError
+from ca2a_runtime.delegation.revocation import RevocationSnapshot
+from ca2a_runtime.errors import CA2AError, ConfigError, TransportError
 from ca2a_runtime.peer import (
     REQUIRE_HARDWARE,
     REQUIRE_NONE,
@@ -29,6 +30,7 @@ from ca2a_runtime.peer import (
 )
 from ca2a_runtime.policy import Policy
 from ca2a_runtime.tee.base import BaseProvider
+from ca2a_runtime.tee.binding import ROLE_CALLEE
 from ca2a_runtime.tee.software import SoftwareProvider
 
 
@@ -56,6 +58,8 @@ class PeerNode:
         require_holder_proof: bool = True,
         trusted_root_issuers: Collection[str] = (),
         agent_manifest: AgentManifestBinding | None = None,
+        revocation_source: Callable[[], RevocationSnapshot | None] | None = None,
+        max_revocation_staleness: int | None = None,
     ) -> None:
         if require_caller_attestation not in REQUIREMENT_VALUES:
             raise ConfigError(
@@ -80,12 +84,23 @@ class PeerNode:
         self.require_holder_proof = require_holder_proof
         self.trusted_root_issuers = frozenset(trusted_root_issuers)
         self.agent_manifest = agent_manifest
+        # A callable rather than a snapshot, because a snapshot goes stale: the
+        # node asks for the current one on every call. Fetching and refreshing
+        # it is the deployment's job.
+        self.revocation_source = revocation_source
+        self.max_revocation_staleness = max_revocation_staleness
         self._private_key, self.channel_public_key = generate_channel_keypair()
         self._challenge_secret = generate_secret()
 
     def offer(self, nonce: str) -> ChannelOffer:
-        """Re-attest the stable enclave channel key under a caller-supplied nonce."""
-        return attest_channel(self.provider, self.channel_public_key, nonce)
+        """Re-attest the stable enclave channel key under a caller-supplied nonce.
+
+        Always a callee-role offer. This is what the public handshake endpoint
+        serves, to any nonce anybody sends, so it must never produce something a
+        callee would accept as a caller offer. A caller offer is minted only for
+        this node's own outbound call (:func:`ca2a_runtime.transport.client.send_task`).
+        """
+        return attest_channel(self.provider, self.channel_public_key, nonce, role=ROLE_CALLEE)
 
     def issue_challenge(self) -> str:
         """Issue a challenge for the caller to bind its own channel key into."""
@@ -109,4 +124,23 @@ class PeerNode:
             audience=self.channel_public_key,
             require_holder_proof=self.require_holder_proof,
             trusted_root_issuers=self.trusted_root_issuers,
+            revocations=None if self.revocation_source is None else self.revocation_source(),
+            max_revocation_staleness=self.max_revocation_staleness,
         )
+
+    def handle_authenticated(self, envelope: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Authenticate a provenance response using the appraised channel key.
+
+        Invalid response contexts fail before admission. Runtime failures after
+        admission remain unknown outcomes unless an authenticated denial is made.
+        """
+        from ca2a_runtime.response import ResponseProducer
+        from ca2a_runtime.transport.wire import serialize_error, serialize_peer_result
+
+        producer = ResponseProducer(self._private_key, envelope)
+        try:
+            body = serialize_peer_result(self.handle(producer.envelope["request"]))
+            status = 200
+        except CA2AError as exc:
+            body, status = serialize_error(exc), exc.http_status
+        return status, producer.finish(status, body)

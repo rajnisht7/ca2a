@@ -1,16 +1,51 @@
 # Limitations
 
-cA2A 0.2 is a Developer Preview with a runnable, tested profile and runtime. This document states plainly what is built, what remains before 1.0, and what is out of scope, so no claim in the documentation runs ahead of the code. This is a deliberate discipline: proof, not promises.
+This page says what cA2A proves today, what it does not, and what is still being
+built, so you can decide how much to rely on it. Read it before you rely on any
+hardware claim.
+
+cA2A 0.4.0 (published as `ca2a-runtime`) is a developer preview with a runnable,
+tested profile and runtime. This document states plainly what is built, what
+remains before 1.0, and what is out of scope, so no claim in the documentation runs
+ahead of the code. This is a deliberate discipline: proof, not promises.
+
+In short:
+
+- **Works offline today, no hardware needed:** checking that a chain of permissions
+  starts at an authority you trust and only narrows at each handoff, refusing
+  revoked grants when you supply a revocation list, encrypting a task to one agent,
+  and checking signed records of each handoff.
+- **Checked on real hardware, with limits:** AMD SEV-SNP and Intel TDX reports from
+  real Azure and GCP machines; an Azure agent calling a GCP agent in one direction;
+  two GCP machines run by one operator checking each other in both directions.
+  Two machines run by different operators checking each other has not yet been shown.
+- **Off unless you turn it on:** checking the platform settings inside a hardware
+  report (such as whether SMT is on), and authenticating the answer that comes back
+  from a call.
+- **Not done at all:** publishing or fetching revocation data. A checker knows only
+  about the revocations in the snapshot you hand it.
+
+## Opt-in response authentication
+
+`send_task(require_authenticated_response=True)` authenticates readable
+provenance or denial to the live caller using a request-bound session MAC. The
+default legacy path remains unauthenticated. The profile supplies one-use,
+expiring client verification, not request-execution deduplication, portable
+signed receipts or confidential output encryption. Both session parties know the
+MAC key. Hardware assurance still requires explicit hardware appraisal; the new
+profile has software/HTTP tests and no new live-hardware validation. See the
+[profile and deployment limits](docs/spec/response-authentication.md).
 
 ## What is built
 
-- The delegation credential model and the offline chain verifier skeleton: signature checks, scope attenuation (a child grant must be a provable subset of its parent), depth limits, and cross-chain replay rejection. The hardest of these semantics is reused from [agent-manifest](https://github.com/agentrust-io/agent-manifest), where it is implemented and tested.
+- The delegation credential model and offline chain verifier: trusted-root checks, signatures, scope attenuation, depth and validity bounds, duplicate credential IDs within a chain, and cross-chain splice rejection. These checks do not maintain a global history of used credentials.
+- Revocation of a delegation before its validity window closes. The issuer of a credential, or an issuer above it in the chain, signs a revocation statement naming the credential by digest; a verifier given a snapshot of such statements refuses a chain containing a revoked hop (`CREDENTIAL_REVOKED`). A delegate cannot revoke its delegator, statements cannot be un-revoked, and a snapshot carrying a forged or unsigned statement is refused as a whole. **What it does not do:** cA2A does not publish or fetch revocation data, so a verifier knows only what its supplied snapshot held at its `as_of` time, and a supplier can withhold a statement. A verifier with no snapshot still verifies offline and cannot learn of a revocation; the result says revocation was `not_checked`. `max_revocation_staleness` lets a verifier fail closed without a recent snapshot, but it is off by default, and `ca2a start` does not load a snapshot.
 - Configuration, error registry, and the CLI surface, including `ca2a start`, which builds a `PeerNode` from a config file and serves it over the reference transport.
 - A reference HTTP transport and the attestation handshake, in software mode. `ca2a_runtime.transport.server` and `ca2a_runtime.transport.client` (standard library only) run a live inbound A2A-profile call end to end: the caller fetches the callee's attested channel key, seals a payload to it, and sends a delegated task; the callee parses the A2A metadata with the adapter, runs verify + policy + enforce + open-sealed + provenance, and replies. `ca2a_runtime.attestation` gates the seal on a verified channel key. This is a **reference** transport, not part of the profile: the profile mandates no wire protocol (see Out of scope), and in software mode the peer key is accepted at `assurance="none"`.
 
 ## What remains before 1.0
 
-- **Hardware-attested live binding.** The `verifier` seam in `ca2a_runtime.attestation` has now been driven off a real SEV-SNP quote on an Azure confidential VM: `verify_offer` returned `assurance="hardware"`, a payload was sealed to a channel key a hardware-verified measurement vouches for, and both a measurement mismatch and a stale nonce were rejected. See [docs/hardware-validation.md](docs/hardware-validation.md). Two gaps remain. First, the reference server/client still run in **software mode** by default (`assurance="none"`); the hardware path is a validated capability, not the default configuration. `ca2a start` inherits that: it refuses to start under `provider: auto` when no confidential-computing platform is detected, so a software-mode listener is always a config that names `software-only`, never a downgrade. Second, attestation on that run was one-directional: a follow-on cross-operator run (an Azure SEV-SNP peer calling a GCP Intel TDX peer, recorded in the same document) had the caller appraise the callee's real TDX quote before sealing, but the callee did not appraise the caller in return. The *protocol* is no longer one-directional -- a callee now issues a challenge and appraises the caller's offer before opening the sealed payload ([docs/spec/mutual-attestation.md](docs/spec/mutual-attestation.md)) -- but that is implemented and tested in **software mode only**, it is off by default, and making the protocol mutual does not make the recorded hardware run mutual. Mutual attestation on real silicon in both directions is still outstanding, it is still not *simultaneous* (the caller commits a sealed payload before the callee has appraised it), and both peers were driven by one operator's harness.
+- **Hardware-attested live binding.** Earlier Azure SNP and cross-cloud TDX runs established one-directional appraisal, described in [docs/hardware-validation.md](docs/hardware-validation.md). On September 17, 2026, two temporary GCP SNP guests completed mutual appraisal and sealed nonsecret delivery in both directions, with separately collected receiver logs and matching payload hashes. A paced diagnostic passed one positive and ten rejection cases per direction; initial burst runs timed out. See [the mutual hardware procedure](docs/mutual-hardware-acceptance.md). Both guests were in one project under one operator. Their bootstrap launch measurements did not identify application code installed after boot. Reports showed SMT enabled and ciphertext hiding absent; stricter platform policies correctly refused them. This does not establish cross-operator confidentiality or complete information-flow enforcement. The general reference client/server still default to software assurance unless hardware verification is configured; `require_hardware=True` explicitly rejects software callee offers. Mutual appraisal remains sequential: the caller commits a sealed payload before the callee appraises it.
 - **Sealed peer channel (hardware property).** The channel is implemented: a payload is sealed to the peer's attested X25519 key (X25519 ECDH, HKDF-SHA256, ChaCha20-Poly1305), and only the holder of the peer's private key can open it. On a live call the handshake now gates the seal on a channel key the caller has appraised, but in software mode that appraisal is `assurance="none"`. Until the seal is bound to a hardware-verified measurement (above), do not assume a payload is confined to a specific attested measurement. Adapter-decoded `sealed_payload` bytes are opaque ciphertext only.
 - **Real hardware attestation.** The **SEV-SNP and Intel TDX verifiers now appraise genuine hardware evidence end to end**: a real Azure CVM SEV-SNP report (VCEK chain to the AMD ARK-Milan root, ECDSA-P384 report signature, measurement binding) and a real GCP C3 DCAP v4 TDX quote (PCK chain to the Intel SGX Root CA, QE binding, quote signature, MRTD binding), both fail-closed and both rejecting a tampered copy. Runs are recorded in [docs/hardware-validation.md](docs/hardware-validation.md). The **TPM 2.0 verifier** (AK chain to a caller-supplied vendor root, AK signature, magic/type, and the key-and-nonce binding) is implemented, and its cryptography is delegated to `agent_manifest.verify_tpm_quote` rather than being a third copy. Quote *generation* for SEV-SNP and TDX is implemented through the kernel configfs-TSM interface and, **as of 2026-08-24, has been run on real silicon for both**: a GCP `c3-standard-4` produced an 8000-byte DCAP v4 TDX quote that appraised to the Intel SGX Root CA, and a GCP `n2d-standard-4` on AMD Milan produced a 1184-byte SEV-SNP report whose `auxblob` carried the VCEK/ASK/ARK table and which appraised to the ARK and failed closed on a flipped bit. Both were produced by this codebase's own providers and appraised by its own verifiers, so collection is now a validated capability on non-paravisor guests rather than code that should work. Azure confidential VMs are explicitly out of scope for the SEV-SNP collector, since a paravisor-mediated guest cannot set `REPORT_DATA` and roots its channel key through the vTPM instead. This validates those verifiers, not a running attested peer: until the `verifier` seam in `ca2a_runtime.attestation` is driven off a live quote on a confidential VM, cA2A must not be described as attested across trust domains.
 - **TPM collection works on hardware; chained verification does not, on every host.** Measured on a real Azure Trusted Launch vTPM (`Standard_D2s_v7`, eastus2, 2026-08-01). What passed: `TpmProvider.attest` produced a genuine quote signed by the platform attestation key (RSASSA/SHA-256), the shipped certificate certifies the quoting key, `parse_tpmt_signature` unwrapped the real `TPMT_SIGNATURE` and the bare signature verified against the shipped key, a tampered attest blob was rejected, and the quote's `extraData` equalled the derived key-and-nonce binding. Collector and verifier also ran **in one process**, which the previous caveat here said was untested: building `tpm2-pytss` from source inside a venv resolves the conflict with `agent-manifest`'s `cryptography`, so that tooling limitation is retired.
@@ -18,7 +53,7 @@ cA2A 0.2 is a Developer Preview with a runnable, tested profile and runtime. Thi
   What **failed**, and it is the important half: `verify_tpm_report` could not chain to a pinned root, reporting "AK chain root is not among the supplied trusted TPM roots". On that host the AK certificate at NV `0x01C101D0` is 994 bytes, is issued by `CN=Global Virtual TPM CA - 03`, and carries **no AIA extension at all**, so there are no intermediates to fetch and none stored elsewhere in NV. A different Azure host (`Standard_D2s_v5`, eastus, 2026-07-31) presented a 1596-byte certificate under `Azure Cloud Virtual TPM CA - 11` with a walkable AIA chain reaching the root pinned in `ca2a_verify/tpm_roots.py`. Both observations are real: Azure runs more than one vTPM CA generation, so **the shipped Azure root is not sufficient fleet-wide** and a deployment must pin the hierarchy its own hosts actually present. Until then, treat the TPM tier as: evidence is genuine and its signature and binding are verifiable, but key provenance is host-dependent.
 - **TPM evidence proves key provenance only where a chain reaches a pinnable root.** A quote signed by the transient fallback key is a verifiable signature but carries no certificate chain, so it proves nothing about *where* the key lives, and `verify_tpm_report` rejects it. As above, a platform-provisioned certified attestation key is necessary but not sufficient: the chain must also be assemblable, which fails when the AK certificate carries no AIA. A GCP Shielded VM is weaker still (probed 2026-07-31: no EK certificate, no persistent handles, and `get-shielded-identity` returns a bare `ekPub` with no certificate). Client firmware TPM vendor roots are not yet published in a pinnable form. Separately, the TCG event log is 0 bytes on both Azure and GCP, so PCR values cannot be attributed to specific boot events on either cloud.
 
-## Platform state is not appraised
+## Platform-state appraisal is opt-in {#platform-state-is-not-appraised}
 
 <!-- The marked block below is shared verbatim with trace-spec and cmcp.
      trace-spec/LIMITATIONS.md is the source and the limitations-parity
@@ -66,6 +101,19 @@ reference verifier's single-struct policy.
 attested-peer and sealed-channel paths do not set a policy for you. A deployment that cares
 whether SMT was enabled or the firmware finished its DRAM alias check has to say so explicitly.
 cA2A gives you the mechanism and the vocabulary; it does not pick your policy.
+
+The library helper `ca2a_verify.sev_snp.sev_snp_verifier` now requires an expected
+measurement, minimum guest SVN and explicit required/forbidden platform sets. It
+requires VMPL0 and rejects guest-policy DEBUG after signature verification. These
+guest policy checks do not establish firmware TCB currency. It binds signed report
+data to the channel key and nonce and can be supplied to either peer's verifier
+seam. Its VCEK chain must be provisioned for the target host; collateral freshness,
+revocation and full TCB policy are not established by this helper. On the client,
+`send_task(..., require_hardware=True)` rejects software-only offers before sealing
+or sending. This setting is opt-in; supplying a verifier alone retains software
+compatibility. These changes have synthetic test coverage and the bounded
+September 17 same-project hardware diagnostic described above; strict platform
+acceptance and cross-operator validation remain open.
 
 ## Out of scope
 

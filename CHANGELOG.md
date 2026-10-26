@@ -7,7 +7,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Sealing to a low-order X25519 peer key raises `SealedChannelError`, consistent
+  with other invalid channel keys, instead of leaking a backend `ValueError`.
+  These keys were already refused; no ciphertext format or acceptance rule changes.
+
+### Removed
+
+- The `opaque` attestation provider value. It had no collector and was never
+  selectable at runtime; a config naming `provider: opaque` now fails at load
+  with `unknown attestation provider`, like any other unknown provider. Docs,
+  example configs and the issue template no longer list it.
+
+## [0.4.0] - 2026-09-30
+
+### Security
+
+- A delegate with no enclave could be recorded as `caller_attestation="hardware"`
+  by relaying an honest hardware peer's attestation: it asked that peer's public
+  `/.well-known/ca2a/channel` endpoint to attest under the target's challenge and
+  presented the result as its `caller_offer`. Caller offers are now minted in a
+  separate role, signed under their own binding prefixes (`ca2a-*-caller-v2|`),
+  and the handshake endpoint only mints callee-role offers. The caller must also
+  send `caller_possession`, a MAC over the request transcript keyed from X25519
+  between its attested channel key and the callee's, which the callee verifies
+  before recording any outcome.
+
+### Changed
+
+- **Breaking for callers that send `caller_offer`** (`ca2a-caller-offer-v2`). A
+  pre-v2 caller offer has no `role` and no `caller_possession` and is refused with
+  `ATTESTATION_FAILED`. Callers that send no offer, and the handshake response,
+  are unchanged on the wire. `BaseProvider.attest` and the binding helpers
+  (`tpm_qualifying_data`, `snp_report_data`, `tdx_report_data`) take a keyword
+  `role`, defaulting to the callee role; a custom `Verifier` must derive the
+  binding under `report.role`.
+
+## [0.3.1] - 2026-09-26
+
+### Fixed
+
+- Malformed input from outside now fails with the documented error instead of
+  escaping as a Python exception. `TdxQuote.parse` confines reads to the declared
+  signature section and checks each nested length (it raised `struct.error` on a
+  short section); `verify_challenge` refuses a MAC that is not 64 lowercase hex
+  (a non-ASCII one raised `TypeError`); `DelegationCredential.from_dict` and
+  `verify_trace_dag` refuse entries that are not objects; the reference server
+  answers 400 to bodies that hit the JSON parser's nesting or integer-digit
+  limits instead of dropping the connection (#202).
+- `canonicalize` refuses non-string object keys. It coerced them with `str()`, so
+  `{1: "a", "1": "b"}` serialized one key twice (#202).
+- The container image installs its dependencies from hash-pinned locks
+  (`requirements/runtime.txt`, `requirements/build.txt`) and pins the base image
+  by digest. ClusterFuzzLite targets cover the wire documents, the attestation
+  parsers and the canonicalizer (#202).
+
+## [0.3.0] - 2026-09-25
+
+### Changed
+
+- Separate authenticated lineage (`verify-lineage`, signed TRACE records plus a
+  trusted credential chain) from unsigned `verify-dag` structural diagnostics
+  (#168). Native DAG success now reports `verified: false` and exits 1 unless
+  `--structural-only` was explicitly requested. See the provenance tutorial for
+  migration and the remaining live-request binding limits.
+
 ### Added
+
+- Add opt-in live response authentication through `require_authenticated_response`.
+  The session-MAC profile binds readable provenance or denial to the appraised
+  peer key, complete request and fresh recipient/session. Verification is expiring
+  and single-use; failed responses retain unknown execution outcomes without retry.
+  This is not portable signed evidence, response encryption or a new hardware result.
+
+- Record acceptance-harness operation timing and unfinished work so transport
+  timeouts remain distinguishable from security rejections. The historical SNP
+  burst timeout remains unexplained; this change adds diagnostics without retries.
+
+- **Delegation revocation.** Until now a delegated grant could not be withdrawn
+  inside its validity window (`docs/spec/threat-model.md`). The issuer of a
+  credential, or any issuer above it in the chain, can now sign a
+  `RevocationStatement` naming the credential by the SHA-256 of its canonical
+  body. `verify_chain`, `verify_delegation_chain`, `verify_chain_file`,
+  `handle_peer_request` and `ca2a verify-chain` / `verify-dag` take an optional
+  `RevocationSnapshot` and refuse a chain containing a revoked hop with
+  `CREDENTIAL_REVOKED`, which also refuses every grant beneath it. A delegate
+  cannot revoke upward, a statement from an unrelated key has no effect, nothing
+  can un-revoke, and a snapshot with a forged or unsigned statement is refused as
+  a whole with `INVALID_REVOCATION`. Without a snapshot, verification stays
+  offline and unchanged, and now reports revocation as `not_checked`
+  (`verify_chain` returns a `RevocationStatus`; `ChainResult`, `PeerResult` and
+  the CLI output carry it). An optional `max_revocation_staleness` fails closed
+  with `REVOCATION_STATUS_UNKNOWN` when the snapshot is missing or too old.
+  `PeerNode` takes a `revocation_source` callable consulted on every call.
+  Distributing revocation data remains the deployment's job.
+
+- Add an explicit hardware floor for outbound peer appraisal, a pinned SNP
+  verifier with platform/DEBUG/VMPL/guest-SVN checks, and a two-host acceptance
+  harness. A same-operator hardware diagnostic completed both directions;
+  strict platform acceptance and end-to-end confidentiality remain open.
+
+- **`ca2a start` can demand caller attestation (#160).** The `attestation` block
+  gains `require_caller_attestation` (`none` | `any` | `hardware`),
+  `caller_verifier` (`platform` plus a `trusted_roots_path` PEM bundle), and
+  `challenge_ttl_seconds`, threaded through `bootstrap.build_peer_node` to the
+  `PeerNode` arguments that have existed since the mutual-attestation work. Until
+  now those arguments were reachable only from Python, so a config-driven callee
+  could never appraise its callers. All new paths fail closed: an unknown rung, a
+  `hardware` rung with no verifier, a missing or empty roots file, and a verifier
+  platform with no report-level verifier (`sev-snp`, `tdx`) are each a
+  `CONFIG_ERROR` at startup naming the field, not a callee that appears to appraise
+  and does not. Only `tpm` can be built today. The startup line now prints the rung
+  alongside the provider, and a node with no verifier is told that hardware offers
+  will be refused as unappraisable. `require_holder_proof` is deliberately not
+  exposed.
 
 - **PLATFORM_INFO appraisal on the SEV-SNP path (LIMITATIONS: "Platform state is not
   appraised").** `SevSnpReport.platform_info` decodes the bitfield at offset `0x40`, and
@@ -32,7 +146,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Tests use the real `a2a-sdk` protobuf models and preserve existing card fields
   and unrelated extensions.
 
+### Fixed
+
+- `canonical.py` refuses integers outside the RFC 8785 safe range (magnitude
+  above 2**53 - 1), as it already refused floats (#159). Under the ECMAScript
+  Number conversion RFC 8785 requires, 9007199254740992 and 9007199254740993
+  serialize identically, so emitting them verbatim diverged from a conforming
+  verifier. Matches agent-manifest#404 and trace-spec.
+- Reusing an `a2a-sdk` `Message` across calls no longer carries an earlier
+  task's `sealed_payload`, `caller_offer` or `holder_proof` into the next one
+  (#166, #167). `attach_to_sdk_message` now clears stale optional cA2A keys.
+- The reference wire codec carries hardware attestation evidence, so a live
+  call can present a hardware offer instead of dropping it in transit (#143).
+- `verify_trace_dag` reports a parent link that names a digest it does not
+  compute (such as `sha384:`) as `TRACE_DIGEST_UNSUPPORTED` rather than as
+  `ProvenanceLinkBroken`, which means tampering (#119). Every sha256 chain
+  verifies as before.
+- The inbound peer path verifies the delegation chain once per request instead
+  of twice (#120).
+
 ### Security
+
+- **`cross_check_trace_dag` binds each record's signing key to the chain's named
+  delegate (#184).** It already matched non-root `credential_id` values and path
+  length, but never compared `cnf.jwk` to `chain[i].subject`. When an auditor's
+  `trusted_keys` spanned more than one chain, a record signed by a key trusted
+  for something else could be attributed to the wrong delegate while still
+  verifying. The free-text TRACE `subject` field remains a different namespace
+  and is still not compared; this is the raw Ed25519 key the hop acted under.
+  The trace-dag demo now signs each hop with that credential's subject key.
+
+- TPM report verification now preserves the parsed `TPMT_SIGNATURE` algorithm
+  metadata alongside the signature when it delegates to Agent Manifest. Previously
+  cA2A parsed `sig_alg` and `hash_alg`, then passed only the bare signature to
+  the shared verifier's legacy defaults (RSASSA/SHA-256 for these RSA cases).
+  A valid RSAPSS/SHA-384 report therefore failed, while changing an
+  RSASSA/SHA-256 envelope to falsely
+  declare RSAPSS or SHA-384 did not change the verification decision. The
+  declared scheme and digest now govern verification, so their consistency
+  with the signature operation is checked, with regression tests for both
+  two-byte fields. The `TPMT_SIGNATURE` wrapper is not itself part of the
+  signed `TPMS_ATTEST` bytes. The lower-level bare-signature API now applies its
+  ECDSA/SHA-256 or RSASSA/SHA-256 compatibility default explicitly according to
+  the AK key type. It no longer lets a valid bare RSA signature whose first two
+  bytes resemble a TPM algorithm id be misparsed as an envelope. This change
+  does not add an algorithm-strength policy.
 
 - Offline delegation verification now requires an explicit trusted root issuer.
   The core `verify_chain` API also fails closed when callers omit the trust set,
@@ -289,6 +447,9 @@ built/stubbed boundary.
 - The sealed channel does not by itself establish the enclave-held-private-key property; that is a hardware attestation guarantee that lands with real-hardware validation.
 - Alpha schemas: the delegation credential and TRACE link schemas are not yet stable or versioned, and peer attestation evidence is not yet RATS/EAT conformant.
 
-[Unreleased]: https://github.com/agentrust-io/ca2a/compare/v0.2.0...main
+[Unreleased]: https://github.com/agentrust-io/ca2a/compare/v0.4.0...main
+[0.4.0]: https://github.com/agentrust-io/ca2a/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/agentrust-io/ca2a/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/agentrust-io/ca2a/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/agentrust-io/ca2a/compare/v0.1.0a1...v0.2.0
 [0.1.0a1]: https://github.com/agentrust-io/ca2a/releases/tag/v0.1.0a1

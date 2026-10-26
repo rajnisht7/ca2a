@@ -21,15 +21,24 @@ DEMO = REPO_ROOT / "examples" / "rejection-with-proof" / "demo.py"
 
 @pytest.fixture(scope="module")
 def demo_run(tmp_path_factory) -> subprocess.CompletedProcess[str]:
+    # The demo rewrites chain.json and dag.json beside itself with fresh keys.
+    # Put the committed bytes back as soon as it exits, so the suite leaves the
+    # checkout clean and the committed-artifact test below reads what is
+    # committed rather than whatever this run generated.
+    committed = {p: p.read_bytes() for p in (DEMO.parent / "chain.json", DEMO.parent / "dag.json")}
     env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
-    return subprocess.run(  # noqa: S603
-        [sys.executable, str(DEMO)],
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-        env=env,
-        check=False,
-    )
+    try:
+        return subprocess.run(  # noqa: S603
+            [sys.executable, str(DEMO)],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+            env=env,
+            check=False,
+        )
+    finally:
+        for path, data in committed.items():
+            path.write_bytes(data)
 
 
 def test_demo_exits_clean(demo_run) -> None:
@@ -45,10 +54,11 @@ def test_demo_refuses_the_over_scoped_call(demo_run) -> None:
 
 
 def test_demo_denial_verifies_through_the_cli(demo_run) -> None:
-    """The CLI line the README quotes must actually say denied and verified."""
+    """The CLI line the README quotes must report a structurally consistent unsigned denial."""
     line = next(ln for ln in demo_run.stdout.splitlines() if '"outcome": "denied"' in ln)
     payload = json.loads(line.strip())
-    assert payload["verified"] is True
+    assert payload["verified"] is False
+    assert payload["structural_verified"] is True
     assert payload["cross_checked"] is True
     assert payload["requested_capability"] == "tool:purchase"
     assert payload["effective_scope"] == ["tool:search"]

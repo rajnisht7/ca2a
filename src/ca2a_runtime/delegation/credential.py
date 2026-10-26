@@ -13,6 +13,10 @@ five invariants:
 5. Validity: each hop's validity window, when present, contains the
    evaluation time.
 
+When the caller supplies a revocation snapshot, a sixth check refuses a chain
+containing a hop revoked by its issuer or an issuer above it. See
+ca2a_runtime.delegation.revocation.
+
 Canonicalization uses RFC 8785 (JSON Canonicalization Scheme), so the signed
 byte string is identical across conforming implementations and cA2A signatures
 are cross-verifiable with agent-manifest. See ca2a_runtime.canonical.
@@ -33,13 +37,21 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from ca2a_runtime.canonical import canonicalize
+from ca2a_runtime.delegation.revocation import (
+    REVOCATION_NOT_CHECKED,
+    RevocationSnapshot,
+    RevocationStatus,
+    credential_digest,
+)
 from ca2a_runtime.errors import (
     BrokenDelegationLink,
     CredentialExpired,
     CredentialNotYetValid,
     CredentialReplay,
+    CredentialRevoked,
     DelegationDepthExceeded,
     InvalidCredential,
+    RevocationStatusUnknown,
     ScopeEscalation,
     UntrustedDelegationRoot,
 )
@@ -155,6 +167,13 @@ class DelegationCredential:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DelegationCredential:
+        # A chain document is untrusted JSON. set() over a number or null raises
+        # TypeError, and over a string or list would treat its characters or
+        # items as field names, so anything but an object is refused up front.
+        if not isinstance(data, dict):
+            raise InvalidCredential(
+                "credential must be a JSON object", detail=f"got {type(data).__name__}"
+            )
         unknown = set(data) - _REQUIRED_CREDENTIAL_FIELDS - _OPTIONAL_CREDENTIAL_FIELDS
         missing = _REQUIRED_CREDENTIAL_FIELDS - set(data)
         if unknown or missing:
@@ -227,7 +246,9 @@ def verify_chain(
     max_depth: int = 8,
     trusted_root_issuers: Collection[str] = (),
     at_time: int | None = None,
-) -> None:
+    revocations: RevocationSnapshot | None = None,
+    max_revocation_staleness: int | None = None,
+) -> RevocationStatus:
     """Verify a root-to-leaf delegation chain, raising on the first violation.
 
     A well-formed chain of length N delegates from the root issuer down to the
@@ -239,6 +260,20 @@ def verify_chain(
     replaying recorded evidence passes the time the action was decided, since a
     window that has lapsed by audit time says nothing about validity at
     decision time.
+
+    ``revocations`` is an optional snapshot of signed revocation statements.
+    With it, a chain containing a hop revoked by that hop's issuer or by any
+    issuer above it raises ``CredentialRevoked``. Without it, verification is
+    exactly as before and stays fully offline, and the returned status has
+    ``checked=False``: the chain may have been revoked and this call would not
+    know. The return value exists so that no caller can read a successful
+    offline verification as "not revoked".
+
+    ``max_revocation_staleness`` (seconds) makes revocation checking mandatory:
+    with it set, a missing snapshot, or one whose ``as_of`` is more than that
+    many seconds before the evaluation time, raises ``RevocationStatusUnknown``.
+    It defaults to ``None`` so that offline verification with no revocation data
+    keeps working.
     """
     # Bounds on the wire are strict JSON integers; the evaluation time they are
     # compared against holds the same line, or True / 1.5 / -1 from a library
@@ -247,6 +282,12 @@ def verify_chain(
         isinstance(at_time, bool) or not isinstance(at_time, int) or at_time < 0
     ):
         raise ValueError("at_time must be a non-negative integer or None")
+    if max_revocation_staleness is not None and (
+        isinstance(max_revocation_staleness, bool)
+        or not isinstance(max_revocation_staleness, int)
+        or max_revocation_staleness < 0
+    ):
+        raise ValueError("max_revocation_staleness must be a non-negative integer or None")
 
     if not chain:
         raise BrokenDelegationLink("empty delegation chain")
@@ -312,3 +353,62 @@ def verify_chain(
                 )
 
         prev = cred
+
+    return _check_revocation(
+        chain,
+        revocations,
+        at_time=at_time,
+        now=now,
+        max_staleness=max_revocation_staleness,
+    )
+
+
+def _check_revocation(
+    chain: list[DelegationCredential],
+    revocations: RevocationSnapshot | None,
+    *,
+    at_time: int | None,
+    now: int,
+    max_staleness: int | None,
+) -> RevocationStatus:
+    """Refuse a revoked hop, then enforce the staleness policy.
+
+    Runs only on a chain whose structure has already verified, so the issuers
+    used as revocation authority are a real, continuous line of delegators.
+    """
+    if revocations is None:
+        if max_staleness is not None:
+            raise RevocationStatusUnknown(
+                "revocation status is required but no revocation snapshot was supplied",
+                detail=f"max_revocation_staleness={max_staleness}",
+            )
+        return REVOCATION_NOT_CHECKED
+
+    # Revocation is looked up before staleness is judged. Revocation is
+    # monotonic, so a statement in an old snapshot is still true: a stale
+    # snapshot can prove a hop revoked, it just cannot prove one is not.
+    authorities: set[str] = set()
+    for i, cred in enumerate(chain):
+        # The issuer of hop i, plus every issuer above it. The subject of hop i
+        # is not added until it issues hop i + 1, so a delegate cannot revoke
+        # the grant it received, or anything above it.
+        authorities.add(cred.issuer)
+        digest = credential_digest(cred)
+        stmt = revocations.effective_revocation(digest, authorities, at_time=at_time)
+        if stmt is not None:
+            raise CredentialRevoked(
+                f"hop {i} credential has been revoked",
+                detail=(
+                    f"credential_id={cred.credential_id} digest={digest} "
+                    f"revoker={stmt.revoker} issued_at={stmt.issued_at}"
+                ),
+            )
+
+    if max_staleness is not None and now - revocations.as_of > max_staleness:
+        raise RevocationStatusUnknown(
+            "revocation snapshot is older than this verifier accepts",
+            detail=(
+                f"as_of={revocations.as_of} at_time={now} max_revocation_staleness={max_staleness}"
+            ),
+        )
+    return RevocationStatus(checked=True, as_of=revocations.as_of)

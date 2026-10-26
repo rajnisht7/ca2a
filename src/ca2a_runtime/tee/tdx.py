@@ -31,7 +31,13 @@ from cryptography.hazmat.primitives.serialization import Encoding
 
 from ca2a_runtime.errors import AttestationFailed, AttestationUnsupported
 from ca2a_runtime.tee.base import AttestationReport, BaseProvider
-from ca2a_runtime.tee.binding import TDX_PREFIX, derive_binding, pad_report_data
+from ca2a_runtime.tee.binding import (
+    ROLE_CALLEE,
+    TDX_PREFIX,
+    derive_binding,
+    pad_report_data,
+    role_prefix,
+)
 from ca2a_runtime.tee.tsm import (
     PROVIDER_TDX_GUEST,
     collect_report,
@@ -67,13 +73,15 @@ TDX_GUEST_DEVICE = "/dev/tdx_guest"
 MEASUREMENT_DIGEST_LABEL = "sha384"
 
 
-def tdx_report_data(public_key: str, nonce: str) -> bytes:
+def tdx_report_data(public_key: str, nonce: str, *, role: str = ROLE_CALLEE) -> bytes:
     """Return the 64 bytes a cA2A TDX quote commits in ``REPORTDATA``.
 
     The 32-byte binding digest, zero-padded to the field width. See
     :mod:`ca2a_runtime.tee.binding` and ``docs/spec/attestation.md``.
     """
-    return pad_report_data(derive_binding(TDX_PREFIX, public_key, nonce), TSM_REPORT_DATA_LEN)
+    return pad_report_data(
+        derive_binding(role_prefix(TDX_PREFIX, role), public_key, nonce), TSM_REPORT_DATA_LEN
+    )
 
 
 @dataclass(frozen=True)
@@ -108,24 +116,36 @@ class TdxQuote:
         end = pos + sig_len
         if end > len(blob):
             raise AttestationFailed("TDX quote signature section is truncated")
+        # Every length below comes from the quote, which arrives before anything
+        # about it is verified. Reads are confined to the declared signature
+        # section and each declared length is checked before it is believed, so
+        # a short or lying quote fails as AttestationFailed rather than as a
+        # struct.error escaping the verifier's error contract.
+        sig = blob[pos:end]
+        if len(sig) < QUOTE_SIG_LEN + ATT_KEY_LEN + CERT_DATA_HEADER_LEN:
+            raise AttestationFailed(
+                "TDX quote signature section is truncated",
+                detail=f"declared {sig_len} bytes",
+            )
 
-        quote_sig = blob[pos : pos + QUOTE_SIG_LEN]
-        pos += QUOTE_SIG_LEN
-        att_key = blob[pos : pos + ATT_KEY_LEN]
-        pos += ATT_KEY_LEN
+        quote_sig = sig[:QUOTE_SIG_LEN]
+        att_key = sig[QUOTE_SIG_LEN : QUOTE_SIG_LEN + ATT_KEY_LEN]
+        pos = QUOTE_SIG_LEN + ATT_KEY_LEN
 
         # The QE material is nested, not flat: what follows the attestation key is a
         # certification-data header of type 6 wrapping the QE report, its PCK
         # signature, the auth data and the type-5 PCK chain. Reading the QE report
         # here directly lands six bytes early and rejects every genuine quote.
-        outer_type, outer_len = struct.unpack_from("<HI", blob, pos)
+        outer_type, outer_len = struct.unpack_from("<HI", sig, pos)
         pos += CERT_DATA_HEADER_LEN
         if outer_type != CERT_TYPE_QE_REPORT:
             raise AttestationFailed(
                 "unsupported certification data type",
                 detail=f"type={outer_type}, expected {CERT_TYPE_QE_REPORT} (QE report)",
             )
-        cert_data = blob[pos : pos + outer_len]
+        if pos + outer_len > len(sig):
+            raise AttestationFailed("QE certification data is truncated")
+        cert_data = sig[pos : pos + outer_len]
         if len(cert_data) < QE_REPORT_LEN + QUOTE_SIG_LEN + 2 + CERT_DATA_HEADER_LEN:
             raise AttestationFailed("QE certification data is truncated")
 
@@ -136,10 +156,14 @@ class TdxQuote:
         inner += QUOTE_SIG_LEN
         (qe_auth_len,) = struct.unpack_from("<H", cert_data, inner)
         inner += 2
+        if inner + qe_auth_len + CERT_DATA_HEADER_LEN > len(cert_data):
+            raise AttestationFailed("QE authentication data is truncated")
         qe_auth = cert_data[inner : inner + qe_auth_len]
         inner += qe_auth_len
         cert_type, cert_len = struct.unpack_from("<HI", cert_data, inner)
         inner += CERT_DATA_HEADER_LEN
+        if inner + cert_len > len(cert_data):
+            raise AttestationFailed("PCK certificate chain is truncated")
         cert_bytes = cert_data[inner : inner + cert_len]
         if cert_type != CERT_TYPE_PCK_CHAIN:
             raise AttestationFailed(
@@ -187,7 +211,7 @@ class TdxProvider(BaseProvider):
             return False
         return Path(TDX_GUEST_DEVICE).exists()
 
-    def attest(self, public_key: str, nonce: str) -> AttestationReport:
+    def attest(self, public_key: str, nonce: str, *, role: str = ROLE_CALLEE) -> AttestationReport:
         """Request a TDX quote committing ``public_key`` and ``nonce``.
 
         Raises :class:`AttestationUnsupported` when this host cannot produce a
@@ -196,7 +220,7 @@ class TdxProvider(BaseProvider):
         """
         self._require_host()
 
-        expected = tdx_report_data(public_key, nonce)
+        expected = tdx_report_data(public_key, nonce, role=role)
         outblob, _auxblob = collect_report(expected, expect_provider=PROVIDER_TDX_GUEST)
         quote = TdxQuote.parse(outblob)
 
@@ -225,6 +249,7 @@ class TdxProvider(BaseProvider):
             raw_evidence=outblob,
             quote_signature=quote.quote_signature,
             attestation_key_chain_pem=chain_pem or None,
+            role=role,
         )
 
     @classmethod

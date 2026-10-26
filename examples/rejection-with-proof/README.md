@@ -6,7 +6,7 @@ offline, from the committed files, without trusting the operator that produced
 them.
 
 ```bash
-# From repo root with ca2a-runtime 0.2.0+ installed.
+# From repo root with ca2a-runtime 0.3.0+ installed.
 python examples/rejection-with-proof/demo.py
 ```
 
@@ -30,16 +30,17 @@ produced it:
 ```
 ca2a verify-chain --chain examples/rejection-with-proof/chain.json \
   --trusted-root-issuer <trusted-root-issuer-hex>
-ca2a verify-dag   --dag examples/rejection-with-proof/dag.json \
+ca2a verify-dag --structural-only   --dag examples/rejection-with-proof/dag.json \
                   --chain examples/rejection-with-proof/chain.json
 ```
 
 ```json
-{"verified": true, "records": 4, "leaf_scope": ["tool:search"],
+{"verified": false, "structural_verified": true, "verification": "structural_only",
+ "code": "UNAUTHENTICATED_LINEAGE", "records": 4, "leaf_scope": ["tool:search"],
  "outcome": "denied", "requested_capability": "tool:purchase",
  "effective_scope": ["tool:search"],
  "denial_reason": "capability 'tool:purchase' is not in the effective scope",
- "cross_checked": true}
+ "cross_checked": true, "revocation": "not_checked"}
 ```
 
 ## Why the callee's policy is permissive here

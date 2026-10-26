@@ -1,5 +1,5 @@
 site_name: cA2A
-site_description: The secure, confidential profile for agent-to-agent (A2A) delegation. Attested, attenuated delegation with a sealed peer channel and offline-verifiable provenance, on top of the Agent2Agent (A2A) protocol.
+site_description: Verify signed delegation chains and peer trust evidence for A2A. Start with a local grant and scope-escalation check.
 site_url: https://ca2a.agentrust-io.com
 repo_url: https://github.com/agentrust-io/ca2a
 repo_name: agentrust-io/ca2a
@@ -7,6 +7,7 @@ edit_uri: edit/main/
 docs_dir: .
 exclude_docs: |
   .github/
+  hooks/
   node_modules/
   benchmarks/
   src/
@@ -53,27 +54,25 @@ theme:
     - content.code.copy
     - content.tabs.link
     - toc.follow
-    - header.autohide
   icon:
     repo: fontawesome/brands/github
+
+hooks:
+  # Per-page meta descriptions; see the module docstring.
+  - hooks/seo.py
 
 plugins:
   - search
   - llmstxt:
       full_output: llms-full.txt
       markdown_description: >-
-        cA2A (Confidential A2A) is the secure, confidential way to do
-        agent-to-agent delegation on the Agent2Agent (A2A) protocol. It is a
-        trust profile, not a competing transport: it adds attested, attenuated
-        delegation (each hop's authority is a provable subset of its parent's),
-        runtime attestation of the peer, a sealed peer channel that binds the
-        task payload to the peer's attested measurement, and an
-        offline-verifiable provenance record per hop. If you are looking for a
-        secure version of A2A for multi-agent systems, this is the AgenTrust
-        profile for it. Reuses the delegation semantics from agent-manifest and
-        the TEE and policy primitives from cMCP. Developer preview.
+        cA2A adds signed delegation, peer appraisal, sealed channels, and linked
+        provenance to A2A communication. Begin with offline grant verification
+        against a separately trusted root. Live runtime checks and hardware
+        assurance require additional evidence and explicit relying-party policy.
+        Part of AgenTrust, open specifications for verifiable AI: https://agentrust-io.com.
       sections:
-        Getting started:
+        Get started:
           - index.md
           - docs/quickstart.md
           - docs/concepts.md
@@ -82,8 +81,24 @@ plugins:
           - docs/SPEC.md
           - docs/spec/profile.md
           - docs/spec/delegation-chain.md
+          - docs/spec/sealed-channel.md
           - docs/spec/attestation.md
+          - docs/spec/mutual-attestation.md
+          - docs/spec/conformance.md
+          - docs/spec/error-codes.md
           - docs/spec/threat-model.md
+        Guides:
+          - docs/tutorials/verify-a-delegation-chain.md
+          - docs/tutorials/authoring-a-delegation-credential.md
+          - docs/tutorials/emit-and-verify-provenance.md
+          - docs/tutorials/reproducing-the-claims.md
+          - docs/tutorials/integrating-with-a2a.md
+          - docs/hardware-validation.md
+        Project:
+          - LIMITATIONS.md
+          - ROADMAP.md
+          - GOVERNANCE.md
+          - SECURITY.md
   - minify:
       minify_html: true
   - mkdocstrings:
@@ -128,6 +143,9 @@ markdown_extensions:
 
 extra:
   social:
+    - icon: fontawesome/brands/linkedin
+      link: https://www.linkedin.com/company/agentrust-io/
+      name: AgenTrust on LinkedIn
     - icon: fontawesome/brands/github
       link: https://github.com/agentrust-io/ca2a
   generator: false
@@ -136,51 +154,59 @@ extra_css:
   # Shared AgenTrust editorial design system. Deliberately the only stylesheet:
   # a local override here is how this site drifted to the Material default
   # violet last time. Change the shared file instead.
-  - https://agentrust-io.com/design-system.css
+  # The ?v= matches CSS_VERSION in agentrust-io.github.io tools/site_header.py. Browsers keep these files for hours, so bump it there and here together.
+  - https://agentrust-io.com/design-system.css?v=22
 
 nav:
   - Home: index.md
-  - Quick Start: docs/quickstart.md
-  - How It Works: docs/concepts.md
-  - Configuration: docs/configuration.md
-  - Tutorials:
+  - Get started:
+      - Quick start: docs/quickstart.md
+      - How it works: docs/concepts.md
+      - Configuration: docs/configuration.md
+  - Specification:
+      - Overview: docs/SPEC.md
+      - Profile and transport:
+          - A2A profile: docs/spec/profile.md
+          - Transport binding: docs/spec/transport.md
+          - Response binding (proposal): docs/spec/response-binding-requirements.md
+          - Live response authentication: docs/spec/response-authentication.md
+          - Sealed peer channel: docs/spec/sealed-channel.md
+          - TRACE A2A profile: docs/spec/trace-a2a-profile.md
+      - Delegation and policy:
+          - Delegation chain: docs/spec/delegation-chain.md
+          - Scope-policy intersection: docs/spec/cedar-policy.md
+          - Inbound peer-call decision: docs/spec/call-graph.md
+          - Provenance DAG: docs/spec/provenance-dag.md
+      - Attestation:
+          - Component model: docs/spec/component-model.md
+          - Attestation: docs/spec/attestation.md
+          - Mutual attestation: docs/spec/mutual-attestation.md
+          - Verification library: docs/spec/verification-library.md
+      - Conformance and failure:
+          - Conformance: docs/spec/conformance.md
+          - Error codes: docs/spec/error-codes.md
+          - Failure modes: docs/spec/failure-modes.md
+          - Threat model: docs/spec/threat-model.md
+  - Guides:
       - Verify a delegation chain: docs/tutorials/verify-a-delegation-chain.md
       - Authoring a delegation credential: docs/tutorials/authoring-a-delegation-credential.md
       - Emit and verify provenance: docs/tutorials/emit-and-verify-provenance.md
       - Reproducing the claims: docs/tutorials/reproducing-the-claims.md
       - Integrating with A2A: docs/tutorials/integrating-with-a2a.md
-  - Specification:
-      - Overview: docs/SPEC.md
-      - A2A Profile: docs/spec/profile.md
-      - Transport Binding: docs/spec/transport.md
-      - Component Model: docs/spec/component-model.md
-      - Inbound Peer-Call Decision: docs/spec/call-graph.md
-      - Delegation Chain: docs/spec/delegation-chain.md
-      - Provenance DAG: docs/spec/provenance-dag.md
-      - Sealed Peer Channel: docs/spec/sealed-channel.md
-      - Attestation: docs/spec/attestation.md
-      - Mutual Attestation: docs/spec/mutual-attestation.md
-      - Scope-Policy Intersection: docs/spec/cedar-policy.md
-      - TRACE A2A Profile: docs/spec/trace-a2a-profile.md
-      - Verification Library: docs/spec/verification-library.md
-      - Conformance: docs/spec/conformance.md
-      - Error Codes: docs/spec/error-codes.md
-      - Failure Modes: docs/spec/failure-modes.md
-      - Threat Model: docs/spec/threat-model.md
-  - Testing:
-      - Hardware Validation: docs/hardware-validation.md
+      - Hardware validation: docs/hardware-validation.md
   - Project:
       - Limitations: LIMITATIONS.md
-      - Sponsors: SPONSORS.md
-      - Changelog: CHANGELOG.md
-      - Contributing: CONTRIBUTING.md
-      - Governance: GOVERNANCE.md
-      - Technical Charter: CHARTER.md
-      - Code of Conduct: CODE_OF_CONDUCT.md
-      - Security: SECURITY.md
       - Roadmap: ROADMAP.md
+      - Governance: GOVERNANCE.md
+      - Technical charter: CHARTER.md
+      - Sponsors: SPONSORS.md
+      - Contributing: CONTRIBUTING.md
+      - Changelog: CHANGELOG.md
+      - Security: SECURITY.md
+      - Code of conduct: CODE_OF_CONDUCT.md
       - Privacy: PRIVACY.md
 
 extra_javascript:
   # Shared cross-project top navigation (TRACE / Manifest / cMCP / cA2A / ...)
-  - https://agentrust-io.com/supernav.js
+  # The ?v= matches CSS_VERSION in agentrust-io.github.io tools/site_header.py. Browsers keep these files for hours, so bump it there and here together.
+  - https://agentrust-io.com/supernav.js?v=22
